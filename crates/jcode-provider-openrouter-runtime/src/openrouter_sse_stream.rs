@@ -222,8 +222,16 @@ async fn stream_response(
 
     if !response.status().is_success() {
         let status = response.status();
-        let retry_after = jcode_provider_core::retry_after::retry_after(response.headers());
+        
+        // Extract retry_after from headers before consuming response
+        let retry_after_from_header = jcode_provider_core::retry_after::retry_after(response.headers());
+        
         let body = jcode_base::util::http_error_body(response, "HTTP error").await;
+        
+        // Try HTTP header first, then parse error message body
+        let retry_after = retry_after_from_header
+            .or_else(|| jcode_provider_core::retry_after::parse_retry_from_message(&body));
+        
         let hint = local_endpoint_troubleshooting_hint(&api_base, &model);
         return Err(jcode_provider_core::retry_after::error_with_retry_after(
             format!(

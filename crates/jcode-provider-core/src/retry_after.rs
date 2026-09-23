@@ -111,6 +111,91 @@ pub fn retry_delay(attempt: u32, base_ms: u64, server_hint: Option<Duration>) ->
     server_hint.unwrap_or_else(|| crate::attempt_tracker::retry_backoff_delay(attempt, base_ms))
 }
 
+/// Parse retry time from error message body.
+///
+/// Looks for patterns like:
+/// - "retry after 30 seconds"
+/// - "rate limit exceeded. Resets in 2h 5m"
+/// - "session limit reached. Try again in 300 seconds"
+///
+/// Returns a bounded `RetryAfter` if a valid retry time is found.
+pub fn parse_retry_from_message(error: &str) -> Option<RetryAfter> {
+    parse_retry_duration_from_message(error).map(RetryAfter::new)
+}
+
+fn parse_retry_duration_from_message(error: &str) -> Option<Duration> {
+    let error_lower = error.to_lowercase();
+
+    // Only process if it looks like a rate/session limit error
+    if !error_lower.contains("rate limit")
+        && !error_lower.contains("rate_limit")
+        && !error_lower.contains("session limit")
+        && !error_lower.contains("429")
+        && !error_lower.contains("too many requests")
+    {
+        return None;
+    }
+
+    // Look for "retry after X seconds" or "try again in X seconds" pattern
+    if let Some(idx) = error_lower.find("retry").or_else(|| error_lower.find("try again")) {
+        let after = &error_lower[idx..];
+        for word in after.split_whitespace().skip(1).take(10) {
+            if let Ok(secs) = word
+                .trim_matches(|c: char| !c.is_ascii_digit())
+                .parse::<u64>()
+                && secs > 0
+                && secs <= MAX_RETRY_AFTER.as_secs()
+            {
+                return Some(Duration::from_secs(secs));
+            }
+        }
+    }
+
+    // Look for "resets in Xh Ym" format
+    if let Some(idx) = error_lower.find("reset") {
+        let after = &error_lower[idx..];
+        let mut total = Duration::ZERO;
+        let mut saw_unit = false;
+
+        for word in after.split_whitespace().take(8) {
+            // Extract all digits from the start
+            let digits: String = word.chars().take_while(|c| c.is_ascii_digit()).collect();
+            
+            if digits.is_empty() {
+                continue;
+            }
+
+            let value: u64 = match digits.parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // Get the part after the digits and extract unit letters
+            let rest = &word[digits.len()..];
+            let unit: String = rest.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+            
+            let secs = match unit.as_str() {
+                "d" => Some(value * 86400),
+                "h" => Some(value * 3600),
+                "m" | "min" => Some(value * 60),
+                "s" | "sec" => Some(value),
+                _ => None,
+            };
+
+            if let Some(secs) = secs {
+                total += Duration::from_secs(secs);
+                saw_unit = true;
+            }
+        }
+
+        if saw_unit && total > Duration::ZERO && total <= MAX_RETRY_AFTER {
+            return Some(total);
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +300,64 @@ mod tests {
         };
         let error = error_with_retry_after("rate limited".to_string(), Some(retry_after));
         assert_eq!(retry_after_from_error(&error), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn parses_retry_after_from_error_message() {
+        assert_eq!(
+            parse_retry_duration_from_message("Rate limit exceeded. Retry after 30 seconds."),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn parses_session_limit_message() {
+        assert_eq!(
+            parse_retry_duration_from_message("Session limit reached. Try again in 45 seconds"),
+            Some(Duration::from_secs(45))
+        );
+    }
+
+    #[test]
+    fn parses_resets_in_hours_minutes() {
+        // Only test values within MAX_RETRY_AFTER (60 seconds)
+        assert_eq!(
+            parse_retry_duration_from_message("429 rate limit exceeded. Resets in 0h 0m 45s."),
+            Some(Duration::from_secs(45))
+        );
+    }
+
+    #[test]
+    fn ignores_non_limit_errors() {
+        assert_eq!(
+            parse_retry_duration_from_message("Connection timeout"),
+            None
+        );
+    }
+
+    #[test]
+    fn ignores_resets_longer_than_max() {
+        // 2 hours exceeds MAX_RETRY_AFTER
+        assert_eq!(
+            parse_retry_duration_from_message("Rate limited. Resets in 2h."),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_429_with_retry_seconds() {
+        assert_eq!(
+            parse_retry_duration_from_message("429 Too Many Requests: retry after 45 seconds"),
+            Some(Duration::from_secs(45))
+        );
+    }
+    
+    #[test]
+    fn ignores_session_limit_over_max() {
+        // 300 seconds exceeds MAX_RETRY_AFTER
+        assert_eq!(
+            parse_retry_duration_from_message("Session limit reached. Try again in 300 seconds"),
+            None
+        );
     }
 }
