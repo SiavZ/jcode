@@ -365,22 +365,38 @@ fn test_search_typing_while_loading_survives_reseed_and_filters() {
 }
 
 #[test]
-fn test_loading_picker_esc_still_closes_while_searching() {
+fn test_loading_picker_esc_clears_query_then_closes() {
     let mut picker = SessionPicker::loading();
     picker.focus_search_input();
     picker
         .handle_overlay_key(KeyCode::Char('x'), KeyModifiers::empty())
         .unwrap();
+    // Same as the loaded picker: a non-empty query is cleared first.
+    let action = picker
+        .handle_overlay_key(KeyCode::Esc, KeyModifiers::empty())
+        .unwrap();
+    assert!(matches!(action, OverlayAction::Continue));
+    assert!(picker.search_query.is_empty());
+    assert!(
+        picker.search_active,
+        "search box keeps focus after clearing"
+    );
     let action = picker
         .handle_overlay_key(KeyCode::Esc, KeyModifiers::empty())
         .unwrap();
     assert!(matches!(action, OverlayAction::Close));
     let mut picker = SessionPicker::loading();
     picker.focus_search_input();
+    picker
+        .handle_overlay_key(KeyCode::Char('x'), KeyModifiers::empty())
+        .unwrap();
     let action = picker
         .handle_overlay_key(KeyCode::Char('c'), KeyModifiers::CONTROL)
         .unwrap();
-    assert!(matches!(action, OverlayAction::Close));
+    assert!(
+        matches!(action, OverlayAction::Close),
+        "Ctrl+C always closes"
+    );
 }
 
 #[test]
@@ -428,4 +444,54 @@ fn test_search_bar_always_rendered_with_placeholder() {
         "query should render: {first_row:?}"
     );
     assert!(!first_row.contains("Type to search sessions"));
+}
+
+fn rendered_text(picker: &mut SessionPicker) -> String {
+    let backend = ratatui::backend::TestBackend::new(200, 30);
+    let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| picker.render(frame))
+        .expect("render picker");
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.height)
+        .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+        .map(|(x, y)| buffer[(x, y)].symbol().to_string())
+        .collect()
+}
+
+#[test]
+fn test_search_live_claude_t_is_text_and_hint_points_at_tab() {
+    let session = make_claude_session("claude-search-id");
+    let mut picker = SessionPicker::new(vec![session]);
+    picker.set_live_presence_for_test(vec![live_presence("claude:claude-search-id", false)]);
+    picker.focus_search_input();
+
+    assert!(
+        rendered_text(&mut picker).contains("Tab, T take over live Claude"),
+        "search mode keeps the takeover hint, pointing at Tab first"
+    );
+
+    picker
+        .handle_overlay_key(KeyCode::Char('T'), KeyModifiers::empty())
+        .unwrap();
+    assert!(!picker.claude_takeover_confirmation_active_for_test());
+    assert_eq!(
+        picker.search_query, "T",
+        "T is query text in the search box"
+    );
+
+    picker
+        .handle_overlay_key(KeyCode::Backspace, KeyModifiers::empty())
+        .unwrap();
+    picker
+        .handle_overlay_key(KeyCode::Tab, KeyModifiers::empty())
+        .unwrap();
+    assert!(rendered_text(&mut picker).contains(" T take over live Claude"));
+    picker
+        .handle_overlay_key(KeyCode::Char('T'), KeyModifiers::empty())
+        .unwrap();
+    assert!(
+        picker.claude_takeover_confirmation_active_for_test(),
+        "after Tab, T starts the explicit takeover confirmation"
+    );
 }
