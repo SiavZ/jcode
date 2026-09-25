@@ -1993,7 +1993,9 @@ fn test_preview_sticky_prompt_header_appears_after_scrolling() {
     // confirm it carries the "N›" sticky-header marker.
     let preview_inner_x = (w as f32 * 0.40) as u16 + 1;
     let header_row: String = (preview_inner_x..w.saturating_sub(1))
-        .map(|x| buffer[(x, 1)].symbol())
+        // Row 0 is the always-visible search bar, row 1 the preview's top
+        // border, so the first inner content row is row 2.
+        .map(|x| buffer[(x, 2)].symbol())
         .collect();
     assert!(
         header_row.contains('›'),
@@ -2071,7 +2073,9 @@ fn test_preview_sticky_prompt_header_survives_async_preview_load() {
 
     let preview_inner_x = (w as f32 * 0.40) as u16 + 1;
     let header_row: String = (preview_inner_x..w.saturating_sub(1))
-        .map(|x| buffer[(x, 1)].symbol())
+        // Row 0 is the always-visible search bar, row 1 the preview's top
+        // border, so the first inner content row is row 2.
+        .map(|x| buffer[(x, 2)].symbol())
         .collect();
     assert!(
         header_row.contains('›'),
@@ -2601,3 +2605,6 @@ fn preview_without_search_has_no_highlight_and_scrolls_to_bottom() {
         "no search means no highlight color in preview"
     );
 }
+
+#[path = "session_picker_search_tests.rs"]
+mod search;
