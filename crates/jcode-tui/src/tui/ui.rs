@@ -3436,16 +3436,25 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
         )
     };
 
-    // Docked info column. Its rect depends only on the chat column and the
-    // dock's own content: the same rows every frame, whatever the scroll
-    // position or streaming state. It sits at the top of the chat column, from
-    // the first row down to the status line, never over the input.
-    let dock_rect = (info_dock_width > 0).then(|| Rect {
-        x: chat_area.x + chat_area.width - info_dock_width,
-        y: chat_area.y,
-        width: info_dock_width,
-        height: chunks[3].y.saturating_sub(chat_area.y),
-    });
+    // Docked info box. It is vertically centred in the chat column and kept
+    // above the status line. Its rect depends only on the terminal size and
+    // the box's own content, never on the scroll position or streaming.
+    let dock_rect = dock_data
+        .as_ref()
+        .filter(|_| info_dock_width > 0)
+        .and_then(|data| {
+            let column = Rect {
+                x: chat_area.x + chat_area.width - info_dock_width,
+                y: chat_area.y,
+                width: info_dock_width,
+                height: chat_area.height,
+            };
+            info_widget::dock_rect(
+                column,
+                chunks[3].y,
+                info_widget::dock_height(data, info_dock_width),
+            )
+        });
     if let (Some(rect), Some(data)) = (dock_rect, dock_data.as_ref())
         && !show_donut
     {

@@ -109,39 +109,68 @@ pub fn dock_width(data: &InfoWidgetData, chat_width: u16) -> Option<u16> {
     )
 }
 
-/// Draw the dock into `area` (the reserved column). Sections are stacked in a
-/// single bordered panel, top-aligned, separated by a dim rule.
-pub fn render_dock(frame: &mut Frame, area: Rect, data: &InfoWidgetData) {
-    if area.width < 3 || area.height < 3 {
-        return;
-    }
-    let inner_width = area.width - 2;
-    let inner_probe = Rect::new(area.x + 1, area.y + 1, inner_width, area.height - 2);
+/// Every line of the docked box (sections separated by a dim rule) at the
+/// given inner width.
+fn dock_lines(data: &InfoWidgetData, inner: Rect) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     for kind in dock_sections(data) {
-        let section = section_lines(kind, data, inner_probe);
+        let section = section_lines(kind, data, inner);
         if section.is_empty() {
             continue;
         }
         if !lines.is_empty() {
             lines.push(Line::from(Span::styled(
-                "─".repeat(inner_width as usize),
+                "─".repeat(inner.width as usize),
                 Style::default().fg(rgb(55, 55, 65)),
             )));
         }
         lines.extend(section);
     }
-    if lines.is_empty() {
+    lines
+}
+
+/// Height of the docked box (borders included) at column `width`, or 0 when
+/// there is nothing to show.
+pub fn dock_height(data: &InfoWidgetData, width: u16) -> u16 {
+    let inner = Rect::new(0, 0, width.saturating_sub(2), u16::MAX / 2);
+    let lines = dock_lines(data, inner).len() as u16;
+    if lines == 0 {
+        0
+    } else {
+        lines.saturating_add(2)
+    }
+}
+
+/// Where the docked box goes: vertically centred in `column` (the full chat
+/// column height, which only changes with the terminal size), then pulled up
+/// if needed so it stays above `bottom` (the status line). The result never
+/// depends on the scroll position or on the chat text.
+pub fn dock_rect(column: Rect, bottom: u16, box_height: u16) -> Option<Rect> {
+    let usable = bottom.saturating_sub(column.y);
+    if box_height == 0 || usable < 3 {
+        return None;
+    }
+    let height = box_height.min(usable);
+    let centred = column.y + column.height.saturating_sub(height) / 2;
+    let y = centred.min(bottom - height).max(column.y);
+    Some(Rect::new(column.x, y, column.width, height))
+}
+
+/// Draw the docked box into `rect` (from [`dock_rect`]).
+pub fn render_dock(frame: &mut Frame, rect: Rect, data: &InfoWidgetData) {
+    if rect.width < 3 || rect.height < 3 {
         return;
     }
-    let height = (lines.len() as u16 + 2).min(area.height);
-    let rect = Rect::new(area.x, area.y, area.width, height);
-    lines.truncate(height.saturating_sub(2) as usize);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(rgb(70, 70, 80)).dim());
     let inner = block.inner(rect);
+    let mut lines = dock_lines(data, inner);
+    if lines.is_empty() {
+        return;
+    }
+    lines.truncate(inner.height as usize);
     frame.render_widget(ratatui::widgets::Clear, rect);
     frame.render_widget(block, rect);
     frame.render_widget(Paragraph::new(lines), inner);

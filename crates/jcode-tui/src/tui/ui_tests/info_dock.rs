@@ -209,7 +209,7 @@ fn empty_info_has_no_dock() {
 }
 
 #[test]
-fn dock_rect_is_right_aligned_and_starts_at_top() {
+fn dock_box_is_right_aligned_and_vertically_centred() {
     let _lock = viewport_snapshot_test_lock();
     let state = TestState {
         display_messages: ragged_chat(),
@@ -218,7 +218,49 @@ fn dock_rect_is_right_aligned_and_starts_at_top() {
     };
     let lines = render(&state, 160, 40);
     let (row, left, width) = right_box(&lines).expect("info box drawn");
-    assert_eq!(row, 0, "box starts at the top of the chat");
     assert_eq!(left + width, 160, "box is flush with the right edge");
-    let _ = Rect::default();
+    let height = usize::from(info_widget::dock_height(&dock_data(), width as u16));
+    let middle = row + height / 2;
+    assert!(
+        (15..=25).contains(&middle),
+        "box should sit in the middle of a 40-row screen, top row {row}, height {height}"
+    );
+}
+
+/// Typing a long prompt grows the input box. The info box must not move
+/// unless the input would reach it.
+#[test]
+fn docked_info_box_does_not_move_when_input_grows() {
+    let _lock = viewport_snapshot_test_lock();
+    let mut state = TestState {
+        display_messages: ragged_chat(),
+        info_widget_data: dock_data(),
+        ..Default::default()
+    };
+    let before = right_box(&render(&state, 160, 40)).expect("info box drawn");
+    state.input = "a longer prompt that wraps onto a few lines ".repeat(8);
+    state.cursor_pos = state.input.len();
+    let after = right_box(&render(&state, 160, 40)).expect("info box drawn");
+    assert_eq!(before, after, "box moved when the input grew");
+}
+
+#[test]
+fn dock_rect_is_centred_and_stays_above_the_status_line() {
+    let column = Rect::new(100, 0, 40, 40);
+    // Centred in the full column.
+    assert_eq!(
+        info_widget::dock_rect(column, 36, 10),
+        Some(Rect::new(100, 15, 40, 10))
+    );
+    // Pulled up when the status line would cut it off.
+    assert_eq!(
+        info_widget::dock_rect(column, 22, 10),
+        Some(Rect::new(100, 12, 40, 10))
+    );
+    // Clipped to the space above the status line when that is all there is.
+    assert_eq!(
+        info_widget::dock_rect(column, 6, 10),
+        Some(Rect::new(100, 0, 40, 6))
+    );
+    assert_eq!(info_widget::dock_rect(column, 36, 0), None);
 }

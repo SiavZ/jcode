@@ -43,7 +43,7 @@ use crate::provider::DEFAULT_CONTEXT_LIMIT;
 use crate::todo::TodoItem;
 #[cfg(test)]
 pub use dock::set_dock_disabled_for_test;
-pub use dock::{dock_text_lines, dock_width, render_dock};
+pub use dock::{dock_height, dock_rect, dock_text_lines, dock_width, render_dock};
 use memory_render::{render_memory_compact, render_memory_expanded, render_memory_widget};
 use ratatui::{
     prelude::*,
