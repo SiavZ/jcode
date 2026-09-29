@@ -122,6 +122,8 @@ pub fn format_messages(messages: &[Message], is_oauth: bool) -> Vec<ApiMessage> 
         ));
     }
 
+    rewrite_orphaned_tool_results(&mut merged);
+
     // Anthropic rejects a request whose final message is an assistant turn on
     // models that do not support assistant prefill ("This model does not support
     // assistant message prefill. The conversation must end with a user message.").
@@ -202,6 +204,100 @@ pub fn format_messages(messages: &[Message], is_oauth: bool) -> Vec<ApiMessage> 
     }
 
     merged
+}
+
+/// Rewrite any `tool_result` whose `tool_use_id` is not answered by a `tool_use`
+/// in the immediately preceding assistant message into a plain text block.
+///
+/// Anthropic rejects the whole request (400 "unexpected `tool_use_id` found in
+/// `tool_result` blocks") when a result is not paired with the previous
+/// message. This happens when a late tool result is persisted after the
+/// interrupt repair already answered the call and a new assistant turn was
+/// written, leaving the result stranded after an unrelated message. Keeping the
+/// output as text preserves the information while making the history sendable.
+fn rewrite_orphaned_tool_results(messages: &mut [ApiMessage]) {
+    use std::collections::HashSet;
+
+    let mut rewritten = 0usize;
+    for i in 0..messages.len() {
+        if messages[i].role != "user" {
+            continue;
+        }
+        let expected: HashSet<String> = if i > 0 && messages[i - 1].role == "assistant" {
+            messages[i - 1]
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ApiContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            HashSet::new()
+        };
+
+        let has_orphan = messages[i].content.iter().any(|b| {
+            matches!(b, ApiContentBlock::ToolResult { tool_use_id, .. } if !expected.contains(tool_use_id))
+        });
+        if !has_orphan {
+            continue;
+        }
+
+        let mut paired: Vec<ApiContentBlock> = Vec::new();
+        let mut other: Vec<ApiContentBlock> = Vec::new();
+        for block in std::mem::take(&mut messages[i].content) {
+            match block {
+                ApiContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } if !expected.contains(&tool_use_id) => {
+                    rewritten += 1;
+                    let label = if is_error {
+                        "Recovered orphaned tool error"
+                    } else {
+                        "Recovered orphaned tool output"
+                    };
+                    match content {
+                        ToolResultContent::Text(text) => other.push(ApiContentBlock::Text {
+                            text: format!("[{label}: {tool_use_id}]\n{text}"),
+                            cache_control: None,
+                        }),
+                        ToolResultContent::Blocks(blocks) => {
+                            other.push(ApiContentBlock::Text {
+                                text: format!("[{label}: {tool_use_id}]"),
+                                cache_control: None,
+                            });
+                            for b in blocks {
+                                other.push(match b {
+                                    ToolResultContentBlock::Text { text } => {
+                                        ApiContentBlock::Text {
+                                            text,
+                                            cache_control: None,
+                                        }
+                                    }
+                                    ToolResultContentBlock::Image { source } => {
+                                        ApiContentBlock::Image { source }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+                b @ ApiContentBlock::ToolResult { .. } => paired.push(b),
+                b => other.push(b),
+            }
+        }
+        // Paired tool_results must lead the user turn.
+        paired.extend(other);
+        messages[i].content = paired;
+    }
+
+    if rewritten > 0 {
+        jcode_logging::warn(&format!(
+            "[anthropic] Rewrote {rewritten} orphaned tool_result(s) as text to prevent a 400"
+        ));
+    }
 }
 
 /// Returns true when a tool_result body is one of the synthetic placeholders
