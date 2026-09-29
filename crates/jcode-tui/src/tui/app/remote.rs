@@ -234,7 +234,15 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
                 app.status = ProcessingStatus::Idle;
                 app.status_detail = None;
             }
-            let status = if pending.auto_retry {
+            let status = if pending.auto_retry && !pending.is_system && pending.retry_attempts > 0 {
+                // A turn the user typed, held after a transient failure
+                // (provider overload): say plainly that their message is
+                // being sent again.
+                format!(
+                    "✓ Resending your message (attempt {})...",
+                    pending.retry_attempts + 1
+                )
+            } else if pending.auto_retry {
                 format!(
                     "✓ Retrying continuation...{}",
                     if pending.is_system {
