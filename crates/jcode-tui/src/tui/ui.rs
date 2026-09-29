@@ -3059,8 +3059,27 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
         capture.render_order.push("prepare_messages".to_string());
     }
     let prep_start = Instant::now();
-    let chat_left_inset = left_aligned_content_inset(chat_area.width, app.centered_mode());
-    let wide_prepare_width = chat_area.width.saturating_sub(chat_left_inset);
+    // Docked info column: reserve a fixed column on the right of the
+    // transcript so the info box never covers chat text and never moves with
+    // scrolling or streaming. The transcript wraps to the remaining width.
+    // Its rows still span the full chat column (status, input and the rest of
+    // the chrome are unchanged).
+    let dock_data = (crate::config::config().display.info_widget_layout
+        == crate::config::InfoWidgetLayout::Dock
+        && app.info_widget_overlays_enabled()
+        && info_widget::is_enabled()
+        && !swarm_page_active
+        && diff_pane_area.is_none()
+        && diagram_area.is_none())
+    .then(|| app.info_widget_data())
+    .filter(|data| !data.is_empty());
+    let info_dock_width = dock_data
+        .as_ref()
+        .and_then(|data| info_widget::dock_width(data, chat_area.width))
+        .unwrap_or(0);
+    let transcript_width = chat_area.width.saturating_sub(info_dock_width);
+    let chat_left_inset = left_aligned_content_inset(transcript_width, app.centered_mode());
+    let wide_prepare_width = transcript_width.saturating_sub(chat_left_inset);
     let narrow_prepare_width = wide_prepare_width.saturating_sub(1);
     let pinned_mermaid_aspect_ratio =
         diagram_area.and_then(|area| pinned_diagram_preferred_aspect_ratio(area, pane_position));
@@ -3402,14 +3421,36 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
             ..Default::default()
         }
     } else {
+        // With the info dock, the transcript is drawn only in the columns
+        // left of it (matching the width it was wrapped to).
+        let transcript_area = Rect {
+            width: messages_area.width.saturating_sub(info_dock_width),
+            ..messages_area
+        };
         draw_messages(
             frame,
             app,
-            messages_area,
+            transcript_area,
             prepared.clone(),
             chat_scrollbar_visible,
         )
     };
+
+    // Docked info column. Its rect depends only on the chat column and the
+    // dock's own content: the same rows every frame, whatever the scroll
+    // position or streaming state. It sits at the top of the chat column, from
+    // the first row down to the status line, never over the input.
+    let dock_rect = (info_dock_width > 0).then(|| Rect {
+        x: chat_area.x + chat_area.width - info_dock_width,
+        y: chat_area.y,
+        width: info_dock_width,
+        height: chunks[3].y.saturating_sub(chat_area.y),
+    });
+    if let (Some(rect), Some(data)) = (dock_rect, dock_data.as_ref())
+        && !show_donut
+    {
+        info_widget::render_dock(frame, rect, data);
+    }
 
     crate::tui::reset_pinned_diagram_debug_snapshot();
     // Render pinned diagram if we have one
@@ -3520,6 +3561,7 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
     let mut placements: Vec<info_widget::WidgetPlacement> = Vec::new();
     let widget_bounds = messages_area;
     if app.info_widget_overlays_enabled()
+        && info_dock_width == 0
         && !widget_data.is_empty()
         && !show_donut
         && !swarm_page_active

@@ -141,6 +141,12 @@ pin_images = true
 # scrolls, like the sticky previous-prompt preview (default: false)
 # pin_todos = true
 
+# Where the info box (model, context, limits, KV cache, git) lives:
+# "dock" (default) keeps it in a fixed column on the right of the chat that
+# never moves while you scroll or a reply streams; the chat wraps beside it.
+# "float" fits it into gaps between chat lines instead (it moves with the text).
+# info_widget_layout = "dock"
+
 # Queue mode: wait until assistant is done before sending next message
 queue_mode = false
 

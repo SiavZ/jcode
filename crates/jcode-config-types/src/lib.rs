@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 mod display;
-pub use display::DisplayConfig;
+pub use display::{DisplayConfig, InfoWidgetLayout};
 pub mod keybindings;
 mod serde_lenient;
 pub use keybindings::{

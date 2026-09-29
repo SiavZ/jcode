@@ -6,6 +6,8 @@
 //! In left-aligned mode, widgets only appear on the right margin.
 
 use super::color_support::rgb;
+#[path = "info_widget_dock.rs"]
+mod dock;
 #[path = "info_widget_git.rs"]
 mod git;
 #[path = "info_widget_graph.rs"]
@@ -39,6 +41,9 @@ use crate::prompt::ContextInfo;
 use crate::protocol::SwarmMemberStatus;
 use crate::provider::DEFAULT_CONTEXT_LIMIT;
 use crate::todo::TodoItem;
+#[cfg(test)]
+pub use dock::set_dock_disabled_for_test;
+pub use dock::{dock_text_lines, dock_width, render_dock};
 use memory_render::{render_memory_compact, render_memory_expanded, render_memory_widget};
 use ratatui::{
     prelude::*,

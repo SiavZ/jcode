@@ -153,6 +153,8 @@ struct TestState {
     swarm_panel_selected: usize,
     swarm_panel_focused: bool,
     swarm_panel_full_page: bool,
+    /// First transcript line shown when scrolled; `Some` pauses auto-follow.
+    scroll_top_line: Option<usize>,
 }
 
 impl crate::tui::TuiState for TestState {
@@ -205,10 +207,10 @@ impl crate::tui::TuiState for TestState {
         &self.pending_soft_interrupts
     }
     fn scroll_offset(&self) -> usize {
-        0
+        self.scroll_top_line.unwrap_or(0)
     }
     fn auto_scroll_paused(&self) -> bool {
-        false
+        self.scroll_top_line.is_some()
     }
     fn provider_name(&self) -> String {
         self.provider_name
@@ -519,6 +521,8 @@ fn reset_prompt_viewport_state_for_test() {
 mod basic;
 #[path = "diagrams.rs"]
 mod diagrams;
+#[path = "info_dock.rs"]
+mod info_dock;
 #[path = "inline_picker.rs"]
 mod inline_picker;
 #[path = "onboarding.rs"]

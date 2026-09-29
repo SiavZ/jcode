@@ -124,6 +124,24 @@ pub struct DisplayConfig {
     /// reveal when scrolling past the bottom, "on" keeps it always visible.
     #[serde(default, deserialize_with = "crate::serde_lenient::lenient_enum")]
     pub overscroll_status: OverscrollStatusMode,
+    /// Where the info box (model, context, usage, KV cache, git, ...) lives:
+    /// "dock" (default) gives it a fixed column on the right of the chat that
+    /// never moves while you scroll or while a reply streams; "float" uses the
+    /// older behaviour of fitting boxes into gaps between chat lines.
+    #[serde(default, deserialize_with = "crate::serde_lenient::lenient_enum")]
+    pub info_widget_layout: InfoWidgetLayout,
+}
+
+/// Where the info box is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InfoWidgetLayout {
+    /// A fixed column on the right of the chat. The transcript wraps beside
+    /// it, so the box never covers text and never moves.
+    #[default]
+    Dock,
+    /// Boxes placed into free gaps next to the chat text (they move with it).
+    Float,
 }
 impl Default for DisplayConfig {
     fn default() -> Self {
@@ -163,6 +181,7 @@ impl Default for DisplayConfig {
             external_sessions: true,
             usage_display: "left".to_string(),
             overscroll_status: OverscrollStatusMode::default(),
+            info_widget_layout: InfoWidgetLayout::default(),
         }
     }
 }
