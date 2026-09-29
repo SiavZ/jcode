@@ -209,7 +209,7 @@ fn empty_info_has_no_dock() {
 }
 
 #[test]
-fn dock_box_is_right_aligned_and_vertically_centred() {
+fn dock_box_is_right_aligned_and_sits_mid_screen() {
     let _lock = viewport_snapshot_test_lock();
     let state = TestState {
         display_messages: ragged_chat(),
@@ -220,10 +220,10 @@ fn dock_box_is_right_aligned_and_vertically_centred() {
     let (row, left, width) = right_box(&lines).expect("info box drawn");
     assert_eq!(left + width, 160, "box is flush with the right edge");
     let height = usize::from(info_widget::dock_height(&dock_data(), width as u16));
-    let middle = row + height / 2;
     assert!(
-        (15..=25).contains(&middle),
-        "box should sit in the middle of a 40-row screen, top row {row}, height {height}"
+        (10..=16).contains(&row) && row + height < 36,
+        "box should start a third of the way down a 40-row screen and end above \
+         the status line, top row {row}, height {height}"
     );
 }
 
@@ -247,10 +247,14 @@ fn docked_info_box_does_not_move_when_input_grows() {
 #[test]
 fn dock_rect_is_centred_and_stays_above_the_status_line() {
     let column = Rect::new(100, 0, 40, 40);
-    // Centred in the full column.
+    // Top edge a third of the way down the column, whatever the box height.
     assert_eq!(
         info_widget::dock_rect(column, 36, 10),
-        Some(Rect::new(100, 15, 40, 10))
+        Some(Rect::new(100, 13, 40, 10))
+    );
+    assert_eq!(
+        info_widget::dock_rect(column, 36, 14),
+        Some(Rect::new(100, 13, 40, 14))
     );
     // Pulled up when the status line would cut it off.
     assert_eq!(
@@ -263,4 +267,35 @@ fn dock_rect_is_centred_and_stays_above_the_status_line() {
         Some(Rect::new(100, 0, 40, 6))
     );
     assert_eq!(info_widget::dock_rect(column, 36, 0), None);
+}
+
+/// The box's top edge must not move when its own content changes height, for
+/// example when the usage limits come back after the usage endpoint was
+/// throttled. It grows downward instead.
+#[test]
+fn docked_info_box_top_stays_put_when_its_content_grows() {
+    let _lock = viewport_snapshot_test_lock();
+    let mut without_usage = dock_data();
+    without_usage.usage_info = None;
+    let short = TestState {
+        display_messages: ragged_chat(),
+        info_widget_data: without_usage,
+        ..Default::default()
+    };
+    let full = TestState {
+        info_widget_data: dock_data(),
+        ..short.clone()
+    };
+    let (short_row, _, _) = right_box(&render(&short, 160, 40)).expect("box without usage");
+    let full_lines = render(&full, 160, 40);
+    let (full_row, _, _) = right_box(&full_lines).expect("box with usage");
+    assert_eq!(
+        short_row, full_row,
+        "top edge moved when usage lines appeared"
+    );
+    assert!(
+        full_lines.iter().any(|l| l.contains("5-hour")),
+        "usage lines are shown:\n{}",
+        full_lines.join("\n")
+    );
 }

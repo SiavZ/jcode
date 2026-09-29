@@ -141,18 +141,21 @@ pub fn dock_height(data: &InfoWidgetData, width: u16) -> u16 {
     }
 }
 
-/// Where the docked box goes: vertically centred in `column` (the full chat
-/// column height, which only changes with the terminal size), then pulled up
-/// if needed so it stays above `bottom` (the status line). The result never
-/// depends on the scroll position or on the chat text.
+/// Where the docked box goes. Its top edge sits at a fixed row, a third of the
+/// way down the chat column, computed from the column height alone (which only
+/// changes with the terminal size). So the box never moves when the chat
+/// scrolls or streams, when the input grows, or when its own content changes
+/// height (usage limits appearing, todos): it grows and shrinks downward from
+/// that row. Only if it would reach `bottom` (the status line) is it pulled
+/// up, and clipped if the space is smaller than the box.
 pub fn dock_rect(column: Rect, bottom: u16, box_height: u16) -> Option<Rect> {
     let usable = bottom.saturating_sub(column.y);
     if box_height == 0 || usable < 3 {
         return None;
     }
     let height = box_height.min(usable);
-    let centred = column.y + column.height.saturating_sub(height) / 2;
-    let y = centred.min(bottom - height).max(column.y);
+    let anchor = column.y + column.height / 3;
+    let y = anchor.min(bottom - height).max(column.y);
     Some(Rect::new(column.x, y, column.width, height))
 }
 
