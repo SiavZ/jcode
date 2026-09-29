@@ -3436,9 +3436,10 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
         )
     };
 
-    // Docked info box. It is vertically centred in the chat column and kept
-    // above the status line. Its rect depends only on the terminal size and
-    // the box's own content, never on the scroll position or streaming.
+    // Docked info box. Its top edge sits a third of the way down the chat
+    // column and it grows downward, pulled up only near the status line. Its
+    // position and width depend only on the terminal size; its height on its
+    // own content. Never on the scroll position, streaming, or the input.
     let dock_rect = dock_data
         .as_ref()
         .filter(|_| info_dock_width > 0)

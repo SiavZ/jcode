@@ -287,7 +287,7 @@ fn docked_info_box_does_not_move_when_input_grows() {
 }
 
 #[test]
-fn dock_rect_is_centred_and_stays_above_the_status_line() {
+fn dock_rect_top_is_fixed_and_stays_above_the_status_line() {
     let column = Rect::new(100, 0, 40, 40);
     // Top edge a third of the way down the column, whatever the box height.
     assert_eq!(
