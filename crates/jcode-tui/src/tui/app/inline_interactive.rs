@@ -348,16 +348,51 @@ pub(super) fn model_route_provider_group(option: &crate::tui::PickerOption) -> S
     }
 }
 
-fn model_route_matches_scopes(option: &crate::tui::PickerOption, scopes: &[String]) -> bool {
+/// Whether a route belongs to every `@provider` scope. Scopes match the
+/// provider group the route is reached through, so `@fireworks` never picks an
+/// OpenRouter route that merely names Fireworks upstream (selecting it would
+/// send the request through OpenRouter); `@openrouter` covers those routes.
+pub(super) fn model_route_matches_scopes(
+    option: &crate::tui::PickerOption,
+    scopes: &[String],
+) -> bool {
     use crate::provider::normalize_model_route_provider_label as normalize;
     let group = normalize(&model_route_provider_group(option));
-    let provider = normalize(&option.provider);
+    let via_openrouter =
+        crate::provider::ModelRouteApiMethod::parse(&option.api_method).is_openrouter();
     let method = normalize(&option.api_method);
     scopes.iter().all(|scope| {
-        group.contains(scope.as_str())
-            || provider.contains(scope.as_str())
-            || method.contains(scope.as_str())
+        group.contains(scope.as_str()) || (!via_openrouter && method.contains(scope.as_str()))
     })
+}
+
+/// The `@provider` scopes currently narrowing a runtime model picker.
+pub(super) fn model_picker_scopes(picker: &InlineInteractiveState) -> Vec<String> {
+    if picker_is_runtime_model_picker(picker) {
+        split_model_picker_filter(&picker.filter).0
+    } else {
+        Vec::new()
+    }
+}
+
+/// Next route of `entry` in `direction` (-1 or 1) that the scopes allow,
+/// staying put at the ends. Keeps route-column navigation inside the filter
+/// the header shows.
+pub(super) fn step_scoped_route(
+    entry: &crate::tui::PickerEntry,
+    scopes: &[String],
+    forward: bool,
+) -> usize {
+    let allowed = |index: &usize| {
+        scopes.is_empty() || model_route_matches_scopes(&entry.options[*index], scopes)
+    };
+    let current = entry.selected_option;
+    let next = if forward {
+        (current + 1..entry.options.len()).find(allowed)
+    } else {
+        (0..current).rev().find(allowed)
+    };
+    next.unwrap_or(current)
 }
 
 /// Enter on a model picker with no search text and no explicit row choice
@@ -1187,6 +1222,7 @@ impl App {
             column: 0,
             filter: String::new(),
             preview: false,
+            scoped_route_restore: Vec::new(),
         });
         if !preserve_input {
             self.input.clear();
@@ -1488,6 +1524,7 @@ impl App {
             column: 0,
             filter: String::new(),
             preview: false,
+            scoped_route_restore: Vec::new(),
         });
         self.set_status_notice("Updating model list…");
     }
@@ -2158,6 +2195,7 @@ impl App {
             column: 0,
             filter: String::new(),
             preview: false,
+            scoped_route_restore: Vec::new(),
         });
 
         if let Some((preview, filter, selected, column, subagent_model)) = previous_picker
@@ -3475,8 +3513,9 @@ impl App {
                     if picker.column == 0 {
                         picker.selected = picker.selected.saturating_sub(1);
                     } else if let Some(&idx) = picker.filtered.get(picker.selected) {
-                        let entry = &mut picker.entries[idx];
-                        entry.selected_option = entry.selected_option.saturating_sub(1);
+                        let scopes = model_picker_scopes(picker);
+                        let next = step_scoped_route(&picker.entries[idx], &scopes, false);
+                        picker.choose_route(idx, next);
                     }
                 }
             }
@@ -3501,9 +3540,9 @@ impl App {
                         let max = picker.filtered.len().saturating_sub(1);
                         picker.selected = (picker.selected + 1).min(max);
                     } else if let Some(&idx) = picker.filtered.get(picker.selected) {
-                        let entry = &mut picker.entries[idx];
-                        let max = entry.options.len().saturating_sub(1);
-                        entry.selected_option = (entry.selected_option + 1).min(max);
+                        let scopes = model_picker_scopes(picker);
+                        let next = step_scoped_route(&picker.entries[idx], &scopes, true);
+                        picker.choose_route(idx, next);
                     }
                 }
             }
@@ -4047,6 +4086,16 @@ impl App {
         } else {
             (Vec::new(), picker.filter.clone())
         };
+        // Put back routes an earlier scope switched, so each pass starts from
+        // the user's own route choices. Entries still in scope are switched
+        // again below; the rest keep the route the user had before.
+        for (index, original) in std::mem::take(&mut picker.scoped_route_restore) {
+            if let Some(entry) = picker.entries.get_mut(index)
+                && original < entry.options.len()
+            {
+                entry.selected_option = original;
+            }
+        }
         let mut scoped: Option<Vec<usize>> = None;
         if !scopes.is_empty() {
             let mut keep = Vec::new();
@@ -4060,6 +4109,9 @@ impl App {
                         .active_option()
                         .is_some_and(|option| model_route_matches_scopes(option, &scopes))
                     {
+                        picker
+                            .scoped_route_restore
+                            .push((index, entry.selected_option));
                         entry.selected_option = option_index;
                     }
                     keep.push(index);
@@ -4267,6 +4319,7 @@ mod tests {
             column: 0,
             filter: String::new(),
             preview: false,
+            scoped_route_restore: Vec::new(),
         };
         let mut agent_entry = picker_entry("Swarm / subagent", "gpt-5 default", 0);
         agent_entry.action = PickerAction::AgentTarget(AgentModelTarget::Swarm);
@@ -4278,6 +4331,7 @@ mod tests {
             column: 0,
             filter: String::new(),
             preview: false,
+            scoped_route_restore: Vec::new(),
         };
 
         assert!(picker_is_runtime_model_picker(&runtime));
@@ -4329,6 +4383,7 @@ mod tests {
                 column: 0,
                 filter: String::new(),
                 preview: false,
+                scoped_route_restore: Vec::new(),
             };
 
             let next = next_model_favorite_after_current(&picker)
@@ -4361,6 +4416,7 @@ mod tests {
             column: 0,
             filter: "opus".to_string(),
             preview: false,
+            scoped_route_restore: Vec::new(),
         };
 
         App::apply_inline_interactive_filter(&mut picker);
@@ -4381,6 +4437,7 @@ mod tests {
             column: 0,
             filter: "codxe".to_string(),
             preview: false,
+            scoped_route_restore: Vec::new(),
         };
 
         App::apply_inline_interactive_filter(&mut picker);
@@ -4401,6 +4458,7 @@ mod tests {
             column: 0,
             filter: "gpt-5".to_string(),
             preview: false,
+            scoped_route_restore: Vec::new(),
         };
 
         App::apply_inline_interactive_filter(&mut picker);
