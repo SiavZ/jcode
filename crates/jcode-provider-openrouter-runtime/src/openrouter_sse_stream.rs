@@ -37,6 +37,12 @@ fn http_status_hint(status: u16, api_base: &str, model: &str) -> &'static str {
         404 if !is_local => {
             "Hint: the endpoint or model was not found. Check that the base URL includes the API version (usually /v1) and that the model exists on the provider."
         }
+        // The server answered but is overloaded or failing on its side. The
+        // request is retried automatically, so point at the provider, not the
+        // network.
+        500..=599 if !is_local => {
+            "Hint: the provider is overloaded or having a temporary server problem. jcode retries automatically, or switch to another provider with /model."
+        }
         _ => endpoint_hint,
     }
 }
@@ -336,7 +342,10 @@ fn is_retryable_error(error_str: &str) -> bool {
     // not depend on provider-specific body wording.
     match parsed_http_status(error_str) {
         Some(400 | 401 | 402 | 403 | 404 | 405 | 406 | 422) => return false,
-        Some(429) => return true,
+        // 429 rate limit, and every 5xx: the server is up but overloaded or
+        // failing on its side (500, 502, 503, 504, and the non-standard 529
+        // "overloaded" some providers send). Waiting and resending can help.
+        Some(429 | 500..=599) => return true,
         _ => {}
     }
 
@@ -350,6 +359,25 @@ fn is_retryable_error(error_str: &str) -> bool {
                 || error_str.contains("504")
                 || error_str.contains("internal server error"))
         || error_str.contains("overloaded")
+        || is_provider_overload_message(error_str)
+}
+
+/// Wording providers use for a temporary capacity problem, sometimes inside
+/// a 200 SSE stream rather than as an HTTP status (e.g. Openference's
+/// "We're experiencing heavy usage right now ... please try again in a
+/// moment"). `error_str` is already lowercased by the caller.
+fn is_provider_overload_message(error_str: &str) -> bool {
+    [
+        "heavy usage",
+        "temporarily unavailable",
+        "temporary unavailability",
+        "try again in a moment",
+        "server is busy",
+        "at capacity",
+        "capacity constraints",
+    ]
+    .iter()
+    .any(|marker| error_str.contains(marker))
 }
 
 #[cfg(test)]
@@ -422,6 +450,32 @@ mod tests {
         assert!(is_retryable_error(
             "chat request failed\n  status: 429 unknown\n  response: {}"
         ));
+    }
+
+    /// Openference answered a busy period with a 529 and a server_error body
+    /// ("heavy usage ... please try again in a moment"). That is temporary:
+    /// it must be retried, not reported as a failed turn at once.
+    #[test]
+    fn provider_overload_529_is_retryable() {
+        let err = "openai-compatible chat request failed\n  endpoint: \
+            https://api.openference.com/v1/chat/completions\n  model: glm-5.3\n  \
+            status: 529 <unknown status code>\n  response: data: {\"error\":{\"message\":\
+            \"we're experiencing heavy usage right now, which may cause increased latency \
+            or temporary unavailability. we're working on adding more capacity, please try \
+            again in a moment.\",\"type\":\"server_error\"}}data: [done]";
+        assert!(is_retryable_error(err));
+        for status in [500u16, 501, 502, 503, 504, 520, 529, 599] {
+            let err = format!("chat request failed\n  status: {status} whatever\n  response: {{}}");
+            assert!(is_retryable_error(&err), "status {status} should retry");
+        }
+        // The same wording inside a stream error (no HTTP status) retries too.
+        assert!(is_retryable_error(
+            "openai-compatible stream error\n  error: we're experiencing heavy usage right now"
+        ));
+        // Hint names the provider, not the network.
+        let hint = http_status_hint(529, "https://api.openference.com/v1", "glm-5.3");
+        assert!(hint.contains("overloaded"), "{hint}");
+        assert!(!hint.contains("network connectivity"), "{hint}");
     }
 
     /// A 402 means the server answered: the hint must name the billing limit,
