@@ -269,8 +269,11 @@ fn hoist_late_tool_results(messages: &[Message]) -> Vec<Message> {
                     .take_while(|&i| turn[i] == turn[call])
                     .last()
                     .unwrap_or(call);
-                late.insert((mi, bi));
-                moved.entry(anchor).or_default().push(block.clone());
+                let dest = moved.entry(anchor).or_default();
+                for j in std::iter::once(bi).chain(attached_to_result(&msg.content, bi)) {
+                    late.insert((mi, j));
+                    dest.push(msg.content[j].clone());
+                }
             }
         }
     }
@@ -278,7 +281,7 @@ fn hoist_late_tool_results(messages: &[Message]) -> Vec<Message> {
         return messages.to_vec();
     }
     jcode_logging::warn(&format!(
-        "[anthropic] Moved {} late tool_result(s) up to directly follow their tool_use",
+        "[anthropic] Moved {} late tool_result block(s) up to directly follow their tool_use",
         late.len()
     ));
 
@@ -309,6 +312,34 @@ fn hoist_late_tool_results(messages: &[Message]) -> Vec<Message> {
         }
     }
     out
+}
+
+/// Indices of the blocks that belong to the tool_result at `result_idx`, in
+/// order. A tool output is stored as the result followed by its images, each
+/// optionally followed by an "[Attached image ...]" label, so those travel
+/// with the result when it moves.
+fn attached_to_result(blocks: &[ContentBlock], result_idx: usize) -> Vec<usize> {
+    const IMAGE_LABEL_PREFIX: &str = "[Attached image associated with the preceding tool result:";
+    if !matches!(blocks[result_idx], ContentBlock::ToolResult { .. }) {
+        return Vec::new();
+    }
+    let mut attached = Vec::new();
+    let mut after_image = false;
+    let mut end = result_idx + 1;
+    while let Some(block) = blocks.get(end) {
+        let belongs = match block {
+            ContentBlock::Image { .. } => true,
+            ContentBlock::Text { text, .. } => after_image && text.starts_with(IMAGE_LABEL_PREFIX),
+            _ => false,
+        };
+        if !belongs {
+            break;
+        }
+        after_image = matches!(block, ContentBlock::Image { .. });
+        attached.push(end);
+        end += 1;
+    }
+    attached
 }
 
 /// Rewrite any `tool_result` whose `tool_use_id` is not answered by a `tool_use`
