@@ -1395,6 +1395,31 @@ fn test_info_widget_remote_anthropic_api_key_shows_cost_based_usage() {
     );
 }
 
+/// Before the first Anthropic usage fetch lands, the usage state is an empty
+/// default (0% used, no error). The widget must not treat that as data: it
+/// used to flash "100% left" for both limits at startup.
+#[test]
+fn test_info_widget_anthropic_oauth_usage_waits_for_first_fetch() {
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_provider_name = Some("Claude".to_string());
+    app.remote_provider_model = Some("claude-sonnet-4-20250514".to_string());
+    app.remote_resolved_credential = Some(jcode_provider_core::ResolvedCredential::Oauth);
+
+    let data = crate::tui::TuiState::info_widget_data(&app);
+    let usage = data.usage_info.as_ref().expect("anthropic usage info");
+    assert!(
+        !usage.available,
+        "unfetched usage must not render as limits: 5h={} 7d={}",
+        usage.five_hour, usage.seven_day
+    );
+    let text = crate::tui::info_widget::dock_text_lines(&data, 44).join("\n");
+    assert!(
+        !text.contains("100% left"),
+        "startup must not claim full limits:\n{text}"
+    );
+}
+
 #[test]
 fn test_info_widget_remote_openai_billing_follows_resolved_credential() {
     let mut app = create_test_app();

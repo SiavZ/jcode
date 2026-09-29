@@ -485,7 +485,10 @@ impl App {
                     cache_read_tokens: None,
                     cache_write_tokens: None,
                     output_tps,
-                    available: usage.last_error.is_none(),
+                    // Before the first fetch lands, `get_sync` returns an
+                    // empty default (no error, 0% used). Showing that would
+                    // flash "100% left" for both limits, so wait for data.
+                    available: usage.last_error.is_none() && usage.fetched_at.is_some(),
                 })
             }
             WidgetProviderKind::OpenAI => {
