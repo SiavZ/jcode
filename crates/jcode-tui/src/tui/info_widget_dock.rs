@@ -4,15 +4,18 @@
 //! chat lines, so they move whenever the chat scrolls or streams and shrink to
 //! whatever gap is free. The dock instead reserves a column: the transcript is
 //! wrapped narrower so it never runs under the panel, and the panel is drawn at
-//! a fixed position that depends only on the terminal size and the panel's own
-//! content, never on the scroll position or the chat text.
+//! a fixed position and width that depend only on the terminal size, never on
+//! the scroll position, the chat text, or the panel's own content.
 
 use super::*;
 
 /// Narrowest docked column (borders included).
 const DOCK_MIN_WIDTH: u16 = 34;
-/// Widest docked column (borders included).
-const DOCK_MAX_WIDTH: u16 = 60;
+/// Docked column width (borders included) when the terminal has room. Wide
+/// enough for every line the sections draw at full length (context and usage
+/// bars, model and account lines, KV cache), so nothing is cut off, and fixed
+/// so the box never shifts sideways when a line appears or grows.
+const DOCK_WIDTH: u16 = 46;
 /// Columns the chat keeps beside the dock. Below this the dock is not shown.
 const DOCK_MIN_CHAT_WIDTH: u16 = 60;
 
@@ -27,8 +30,8 @@ thread_local! {
 pub fn set_dock_disabled_for_test(disabled: bool) {
     DOCK_DISABLED_FOR_TEST.with(|flag| flag.set(disabled));
 }
-/// Width used to measure natural line widths. Wide enough that no section
-/// shortens its text to fit.
+/// Width used to check whether the overview has anything to show. Wide
+/// enough that no line is shortened.
 const MEASURE_WIDTH: u16 = 200;
 
 /// Sections shown in the dock, top to bottom.
@@ -89,24 +92,13 @@ pub fn dock_width(data: &InfoWidgetData, chat_width: u16) -> Option<u16> {
     if available < DOCK_MIN_WIDTH {
         return None;
     }
-    let kinds = dock_sections(data);
-    if kinds.is_empty() {
+    if dock_sections(data).is_empty() {
         return None;
     }
-    let measure = Rect::new(0, 0, MEASURE_WIDTH, u16::MAX / 2);
-    let natural = kinds
-        .iter()
-        .flat_map(|&kind| section_lines(kind, data, measure))
-        .map(|line| line.width() as u16)
-        .max()
-        .unwrap_or(0);
-    // +2 for the border.
-    Some(
-        natural
-            .saturating_add(2)
-            .clamp(DOCK_MIN_WIDTH, DOCK_MAX_WIDTH)
-            .min(available),
-    )
+    // Depends on the terminal width only. Measuring the content made the box
+    // one column wider (and its left edge jump) whenever a longer line such as
+    // the KV cache line appeared after the first reply.
+    Some(DOCK_WIDTH.min(available))
 }
 
 /// Every line of the docked box (sections separated by a dim rule) at the

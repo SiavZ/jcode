@@ -199,6 +199,48 @@ fn narrow_terminal_has_no_dock() {
     assert!(info_widget::dock_width(&dock_data(), 100).is_some());
 }
 
+/// The box's width must not follow its content. It used to be measured from
+/// the longest line, so the KV cache line appearing after the first reply
+/// widened the box by a column and moved its left edge (seen live).
+#[test]
+fn dock_width_ignores_content() {
+    let before_reply = dock_data();
+    let after_reply = info_widget::InfoWidgetData {
+        cache_hit_info: Some(info_widget::CacheHitInfo {
+            reported_input_tokens: 20_000,
+            prompt_tokens: Some(38_000),
+            last_prompt_tokens: Some(10_000),
+            read_tokens: 15_000,
+            creation_tokens: 3_000,
+            optimal_input_tokens: 16_667,
+            last_reported_input_tokens: Some(10_000),
+            last_read_tokens: Some(9_400),
+            last_creation_tokens: Some(0),
+            last_optimal_input_tokens: Some(9_895),
+            miss_attributions: Vec::new(),
+        }),
+        ..dock_data()
+    };
+    let lines = |data: &info_widget::InfoWidgetData| {
+        info_widget::dock_text_lines(data, 200)
+            .iter()
+            .map(|l| unicode_width::UnicodeWidthStr::width(l.as_str()))
+            .max()
+            .unwrap_or(0)
+    };
+    assert!(
+        lines(&after_reply) > lines(&before_reply),
+        "precondition: the KV cache line is longer than the others"
+    );
+    assert_eq!(
+        info_widget::dock_width(&before_reply, 160),
+        info_widget::dock_width(&after_reply, 160),
+        "box width changed when the KV cache line appeared"
+    );
+    // Narrow terminals still shrink it to what is free.
+    assert!(info_widget::dock_width(&after_reply, 100).unwrap() <= 40);
+}
+
 /// No data, no dock: the chat keeps its full width.
 #[test]
 fn empty_info_has_no_dock() {
@@ -298,4 +340,31 @@ fn docked_info_box_top_stays_put_when_its_content_grows() {
         "usage lines are shown:\n{}",
         full_lines.join("\n")
     );
+}
+
+/// The fixed dock width fits every section at full length, including the
+/// KV cache line (the longest) and a long session name, so nothing is cut.
+#[test]
+fn fixed_dock_width_fits_the_longest_real_lines() {
+    let data = info_widget::InfoWidgetData {
+        session_name: Some("hatchling-worktree".to_string()),
+        cache_hit_info: Some(info_widget::CacheHitInfo {
+            reported_input_tokens: 200_000,
+            prompt_tokens: Some(380_000),
+            last_prompt_tokens: Some(100_000),
+            read_tokens: 150_000,
+            creation_tokens: 30_000,
+            optimal_input_tokens: 166_667,
+            last_reported_input_tokens: Some(100_000),
+            last_read_tokens: Some(94_000),
+            last_creation_tokens: Some(0),
+            last_optimal_input_tokens: Some(98_950),
+            miss_attributions: Vec::new(),
+        }),
+        ..dock_data()
+    };
+    let width = info_widget::dock_width(&data, 160).expect("dock");
+    let natural = info_widget::dock_text_lines(&data, 200);
+    let docked = info_widget::dock_text_lines(&data, width);
+    assert_eq!(natural, docked, "a line was shortened to fit the dock");
 }
