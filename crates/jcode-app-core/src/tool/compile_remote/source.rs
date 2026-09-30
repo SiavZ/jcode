@@ -501,7 +501,12 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         let repo = repo().await;
         let name = std::ffi::OsStr::from_bytes(b"non-utf8-\xff");
-        std::fs::write(repo.path().join(name), b"contents").unwrap();
+        // APFS refuses non-UTF-8 names (EILSEQ), so such a path cannot exist
+        // there and there is nothing to reject.
+        if let Err(error) = std::fs::write(repo.path().join(name), b"contents") {
+            assert_eq!(error.raw_os_error(), Some(libc::EILSEQ), "{error}");
+            return;
+        }
         assert!(
             snapshot(repo.path())
                 .await
