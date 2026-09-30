@@ -803,6 +803,7 @@ pub(super) async fn handle_refresh_models(
                     id,
                     message: format!("Failed to refresh models: {}", err),
                     retry_after_secs: None,
+                    server_resumes: false,
                 });
             }
         }
@@ -1361,6 +1362,7 @@ fn parse_account_kind(
             id,
             message: format!("Unknown account provider '{provider}' (expected claude or openai)"),
             retry_after_secs: None,
+            server_resumes: false,
         });
     }
     kind
@@ -1414,6 +1416,7 @@ async fn handle_set_session_account(
                         crate::session_accounts::provider_display(kind)
                     ),
                     retry_after_secs: None,
+                    server_resumes: false,
                 });
                 return;
             }
@@ -1448,6 +1451,7 @@ async fn handle_set_session_account(
                         crate::session_accounts::provider_display(kind)
                     ),
                     retry_after_secs: None,
+                    server_resumes: false,
                 });
                 false
             }
@@ -1517,6 +1521,7 @@ pub(super) async fn handle_set_default_account(
                 crate::session_accounts::provider_display(kind)
             ),
             retry_after_secs: None,
+            server_resumes: false,
         });
         return;
     }
@@ -1618,6 +1623,7 @@ pub(super) async fn handle_set_account_failover(
                     id,
                     message: format!("Failed to set account failover: {error}"),
                     retry_after_secs: None,
+                    server_resumes: false,
                 });
             }
         }

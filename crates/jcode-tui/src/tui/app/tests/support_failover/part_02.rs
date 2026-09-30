@@ -875,6 +875,7 @@ fn remote_out_of_credit_prompt_runs_countdown_then_switches_and_resends() {
                 id: 1,
                 message: failover_error_message(&remote_profile_failover_prompt()),
                 retry_after_secs: None,
+                server_resumes: false,
             },
             &mut remote,
         );
@@ -918,6 +919,7 @@ fn remote_out_of_credit_countdown_esc_cancels_without_sending() {
                 id: 1,
                 message: failover_error_message(&remote_profile_failover_prompt()),
                 retry_after_secs: None,
+                server_resumes: false,
             },
             &mut remote,
         );
@@ -950,6 +952,7 @@ fn remote_out_of_credit_prompt_in_manual_mode_only_explains() {
                 id: 1,
                 message: failover_error_message(&remote_profile_failover_prompt()),
                 retry_after_secs: None,
+                server_resumes: false,
             },
             &mut remote,
         );

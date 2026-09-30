@@ -170,6 +170,7 @@ pub(super) async fn handle_notify_session(
             id,
             message: format!("Session '{}' is not currently live", session_id),
             retry_after_secs: None,
+            server_resumes: false,
         });
     }
 }
@@ -192,6 +193,7 @@ pub(super) async fn handle_applet_action(
                 id,
                 message: error.to_string(),
                 retry_after_secs: None,
+                server_resumes: false,
             });
             return;
         }
@@ -229,6 +231,7 @@ pub(super) fn handle_close_applet(
                 id,
                 message: error.to_string(),
                 retry_after_secs: None,
+                server_resumes: false,
             });
         }
     }
@@ -304,6 +307,7 @@ pub(super) async fn handle_set_subagent_model(
                 id,
                 message: crate::util::format_error_chain(&error),
                 retry_after_secs: None,
+                server_resumes: false,
             });
         }
     }
@@ -347,6 +351,7 @@ pub(super) fn handle_run_subagent(
                         id,
                         message: crate::util::format_error_chain(&error),
                         retry_after_secs: None,
+                        server_resumes: false,
                     });
                     return;
                 }
@@ -415,6 +420,7 @@ pub(super) fn handle_run_subagent(
                         id,
                         message: crate::util::format_error_chain(&error),
                         retry_after_secs: None,
+                        server_resumes: false,
                     });
                     return;
                 }
@@ -437,6 +443,7 @@ pub(super) fn handle_run_subagent(
                         id,
                         message: crate::util::format_error_chain(&persist_error),
                         retry_after_secs: None,
+                        server_resumes: false,
                     });
                     return;
                 }
@@ -499,6 +506,7 @@ pub(super) async fn handle_set_feature(
                         id,
                         message: crate::util::format_error_chain(&error),
                         retry_after_secs: None,
+                        server_resumes: false,
                     });
                 }
             }
@@ -514,6 +522,7 @@ pub(super) async fn handle_set_feature(
                         id,
                         message: crate::util::format_error_chain(&error),
                         retry_after_secs: None,
+                        server_resumes: false,
                     });
                 }
             }
@@ -620,6 +629,7 @@ pub(super) async fn handle_set_session_saved(
             id,
             message: crate::util::format_error_chain(&error),
             retry_after_secs: None,
+            server_resumes: false,
         });
         return;
     }
@@ -721,6 +731,7 @@ pub(super) async fn handle_rename_session(
                     id,
                     message: crate::util::format_error_chain(&error),
                     retry_after_secs: None,
+                    server_resumes: false,
                 });
                 return;
             }
@@ -896,6 +907,7 @@ pub(super) async fn handle_split(
                 id,
                 message: format!("Failed to save split session: {e}"),
                 retry_after_secs: None,
+                server_resumes: false,
             });
             return;
         }
@@ -950,6 +962,7 @@ pub(super) async fn handle_transfer(
                 id,
                 message: format!("Failed to load session for transfer: {error}"),
                 retry_after_secs: None,
+                server_resumes: false,
             });
             return;
         }
@@ -983,6 +996,7 @@ pub(super) async fn handle_transfer(
                 id,
                 message: format!("Failed to compact session for transfer: {error}"),
                 retry_after_secs: None,
+                server_resumes: false,
             });
             return;
         }
@@ -1006,6 +1020,7 @@ pub(super) async fn handle_transfer(
                     id,
                     message: format!("Failed to create transfer session: {error}"),
                     retry_after_secs: None,
+                    server_resumes: false,
                 });
                 return;
             }
@@ -1302,6 +1317,7 @@ pub(super) async fn handle_agent_task(
                 id,
                 message: crate::util::format_error_chain(&e),
                 retry_after_secs,
+                server_resumes: false,
             });
         }
     }

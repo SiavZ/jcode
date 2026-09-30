@@ -2349,6 +2349,7 @@ async fn client_turn_usage_limit_error_carries_retry_after_secs() {
             id,
             message,
             retry_after_secs,
+            ..
         } = event
         {
             assert_eq!(id, 91);

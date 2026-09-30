@@ -375,6 +375,7 @@ fn test_remote_error_with_retry_after_keeps_pending_for_auto_retry() {
             id: 9,
             message: "rate limited".to_string(),
             retry_after_secs: Some(3),
+            server_resumes: false,
         },
         &mut remote,
     );
@@ -426,6 +427,7 @@ fn test_remote_openference_window_quota_holds_turn_until_resets_at() {
             id: 11,
             message,
             retry_after_secs: None,
+            server_resumes: false,
         },
         &mut remote,
     );
@@ -490,6 +492,7 @@ fn test_remote_provider_overload_529_holds_user_turn_and_retries() {
                 id: 20 + u64::from(attempt),
                 message: overload.to_string(),
                 retry_after_secs: None,
+                server_resumes: false,
             },
             &mut remote,
         );
@@ -527,6 +530,7 @@ fn test_remote_provider_overload_529_holds_user_turn_and_retries() {
             id: 99,
             message: overload.to_string(),
             retry_after_secs: None,
+            server_resumes: false,
         },
         &mut remote,
     );
@@ -622,6 +626,7 @@ fn test_remote_provider_overload_after_partial_output_does_not_resend() {
             id: 41,
             message: OPENFERENCE_529.to_string(),
             retry_after_secs: None,
+            server_resumes: false,
         },
         &mut remote,
     );
@@ -668,6 +673,7 @@ fn test_remote_provider_overload_after_hidden_reasoning_still_resends() {
                 id: 43,
                 message: OPENFERENCE_529.to_string(),
                 retry_after_secs: None,
+                server_resumes: false,
             },
             &mut remote,
         );
@@ -725,6 +731,7 @@ fn test_remote_provider_overload_budget_is_separate_from_other_retries() {
                 id: 60 + u64::from(attempt),
                 message: OPENFERENCE_529.to_string(),
                 retry_after_secs: None,
+                server_resumes: false,
             },
             &mut remote,
         );

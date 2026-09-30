@@ -355,6 +355,7 @@ fn send_agent_busy_error(
             "Cannot handle {request_kind} while the session is busy. Try again after the current turn finishes."
         ),
         retry_after_secs: Some(1),
+        server_resumes: false,
     });
 }
 
@@ -556,6 +557,7 @@ pub(super) async fn handle_client(
                         id: 0,
                         message: format!("Invalid request: {}", error),
                         retry_after_secs: None,
+                        server_resumes: false,
                     },
                 )
                 .await?;
@@ -576,6 +578,7 @@ pub(super) async fn handle_client(
                         id: initial_request.id(),
                         message,
                         retry_after_secs: None,
+                        server_resumes: false,
                     },
                 )
                 .await?;
@@ -1030,6 +1033,7 @@ pub(super) async fn handle_client(
                         id: 0,
                         message: format!("Invalid request: {}", e),
                         retry_after_secs: None,
+                        server_resumes: false,
                     };
                     let json = encode_event(&event);
                     let mut w = writer.lock().await;
@@ -1185,7 +1189,7 @@ pub(super) async fn handle_client(
                 }
                 _ => unreachable!(),
             };
-            let event = response.unwrap_or_else(|error| ServerEvent::Error { id, message: error.to_string(), retry_after_secs: None });
+            let event = response.unwrap_or_else(|error| ServerEvent::Error { id, message: error.to_string(), retry_after_secs: None, server_resumes: false });
             let _ = client_event_tx.send(event);
             continue;
         }
@@ -1263,6 +1267,7 @@ pub(super) async fn handle_client(
         ).await {
             let _ = client_event_tx.send(ServerEvent::Error {
                 id: request.id(), message, retry_after_secs: None,
+                server_resumes: false,
             });
             continue;
         }
@@ -1506,6 +1511,7 @@ pub(super) async fn handle_client(
                         id,
                         message: "Cannot rewind while a turn is processing.".to_string(),
                         retry_after_secs: None,
+                        server_resumes: false,
                     });
                     continue;
                 }
@@ -1556,6 +1562,7 @@ pub(super) async fn handle_client(
                             id,
                             message,
                             retry_after_secs: None,
+                            server_resumes: false,
                         });
                     }
                 }
@@ -1567,6 +1574,7 @@ pub(super) async fn handle_client(
                         id,
                         message: "Cannot undo rewind while a turn is processing.".to_string(),
                         retry_after_secs: None,
+                        server_resumes: false,
                     });
                     continue;
                 }
@@ -1616,6 +1624,7 @@ pub(super) async fn handle_client(
                             id,
                             message,
                             retry_after_secs: None,
+                            server_resumes: false,
                         });
                     }
                 }
@@ -1678,6 +1687,7 @@ pub(super) async fn handle_client(
                         id,
                         message,
                         retry_after_secs: None,
+                        server_resumes: false,
                     });
                     continue;
                 }
@@ -1943,6 +1953,7 @@ pub(super) async fn handle_client(
                     id,
                     message: "debug_command is only supported on the debug socket".to_string(),
                     retry_after_secs: None,
+                    server_resumes: false,
                 });
             }
 
@@ -2467,6 +2478,7 @@ pub(super) async fn handle_client(
                             id,
                             message: error.to_string(),
                             retry_after_secs: None,
+                            server_resumes: false,
                         });
                     }
                 }
@@ -3468,6 +3480,7 @@ async fn append_context_message(
             id,
             message: crate::util::format_error_chain(&error),
             retry_after_secs: None,
+            server_resumes: false,
         },
     };
     let _ = client_event_tx.send(event);
@@ -3505,6 +3518,7 @@ async fn start_processing_message(
             id,
             message: "Already processing a message".to_string(),
             retry_after_secs: None,
+            server_resumes: false,
         });
         return;
     }
@@ -3519,6 +3533,7 @@ async fn start_processing_message(
             id,
             message: format!("Skill '{skill_name}' is not installed on the server"),
             retry_after_secs: None,
+            server_resumes: false,
         });
         return;
     }
@@ -3626,6 +3641,7 @@ async fn start_processing_message(
                 // A usage limit carries its reset so the client holds the
                 // turn and resends at the reset.
                 retry_after_secs: super::usage_limit_resume::error_retry_after_secs(error),
+                server_resumes: false,
             },
         };
         let _ = tx.send(terminal_event);
