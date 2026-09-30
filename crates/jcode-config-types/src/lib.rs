@@ -500,6 +500,30 @@ pub struct NamedProviderConfig {
     /// Must be a JSON object; keys here override jcode-generated body fields.
     #[serde(default, alias = "extra-body", skip_serializing_if = "Option::is_none")]
     pub extra_body: Option<serde_json::Value>,
+    /// Kimi partial-mode thinking prefill seed. When set, a final assistant
+    /// message with `partial: true`, empty `content`, and this string in
+    /// `reasoning_content` is appended to requests for Kimi-family models, so
+    /// the model continues the seeded thinking instead of starting deliberation
+    /// from scratch (Moonshot partial mode). Only sent when the active model is
+    /// a Kimi model and the endpoint is not a strict OpenAI-schema endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_prefill: Option<String>,
+    /// Optional `name` field for the partial-mode prefill message, anchoring
+    /// the response voice to a character (Moonshot docs: "compelling it to
+    /// output content in the voice of the specified character").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_name: Option<String>,
+    /// Apply the profile's `thinking_prefill` to every model on this profile,
+    /// not only Kimi-family models. Some gateways (GLM proxies, z.ai coding
+    /// endpoints) accept the partial-mode assistant prefill for non-Kimi
+    /// models too; this opts the profile in explicitly. The strict
+    /// OpenAI-schema suppression still applies.
+    #[serde(
+        default,
+        alias = "thinking-prefill-non-kimi",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub thinking_prefill_non_kimi: bool,
     /// Whether this endpoint accepts the DeepSeek-style top-level
     /// `reasoning_effort` request field (`/effort` support). When unset, jcode
     /// auto-detects it from the active model id (DeepSeek-family models
@@ -537,6 +561,9 @@ impl Default for NamedProviderConfig {
             allow_provider_pinning: false,
             models: Vec::new(),
             extra_body: None,
+            thinking_prefill: None,
+            prefill_name: None,
+            thinking_prefill_non_kimi: false,
             supports_reasoning_effort: None,
             disable_reasoning_heuristics: false,
         }
