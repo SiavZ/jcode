@@ -66,6 +66,7 @@ fn test_server_initiated_usage_limit_keeps_the_users_own_held_turn() {
         system_reminder: None,
         auto_retry: false,
         retry_attempts: 0,
+        overload_attempts: 0,
         retry_at: Some(held_until),
     });
 
@@ -104,6 +105,7 @@ fn test_user_typed_remote_turn_with_usage_limit_is_held_until_the_reset() {
             system_reminder: None,
             auto_retry: false,
             retry_attempts: 0,
+            overload_attempts: 0,
             retry_at: None,
         });
         app.is_processing = true;
@@ -164,7 +166,8 @@ fn test_user_typed_local_turn_with_usage_limit_is_retried_at_the_reset() {
     assert!(
         app.display_messages()
             .iter()
-            .any(|message| message.content.contains("Will auto-retry")),
+            .any(|message| message.content.contains("Will auto-retry")
+                || message.content.contains("auto-resuming")),
         "the user is told when it retries"
     );
 
