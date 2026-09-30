@@ -67,6 +67,7 @@ include!("tests/prompt_history_cross_session.rs");
 include!("tests/ssh_remote.rs");
 include!("tests/skill_startup.rs");
 include!("tests/resume_search_first.rs");
+include!("tests/usage_limit_resume.rs");
 include!("tests/credentials_changed_resend.rs");
 include!("tests/window_accounts_local.rs");
 #[test]
