@@ -16,6 +16,7 @@ fn held_on_rate_limit_app(hold: Duration) -> App {
         auto_retry: false,
         retry_attempts: 0,
         retry_at: None,
+        overload_attempts: 0,
     });
     app.is_processing = false;
     app.status = ProcessingStatus::Idle;
@@ -142,6 +143,7 @@ fn test_rate_limit_error_for_turn_started_before_account_change_retries_promptly
         auto_retry: false,
         retry_attempts: 0,
         retry_at: None,
+        overload_attempts: 0,
     });
     app.is_processing = true;
     app.status = ProcessingStatus::Streaming;
@@ -188,6 +190,7 @@ fn test_rate_limit_error_without_account_change_keeps_full_hold() {
         auto_retry: false,
         retry_attempts: 0,
         retry_at: None,
+        overload_attempts: 0,
     });
     app.is_processing = true;
     app.status = ProcessingStatus::Streaming;

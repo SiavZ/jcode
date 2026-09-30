@@ -86,6 +86,17 @@ pub(super) enum RemoteEventOutcome {
     Quit,
 }
 
+/// Notice for a turn the user typed that was held after a transient failure
+/// (provider overload) and is now sent again: say plainly that their message
+/// is being resent, instead of the internal "Retrying continuation" wording.
+pub(super) fn held_user_turn_resend_notice(
+    pending: &super::PendingRemoteMessage,
+) -> Option<String> {
+    let resends = u16::from(pending.overload_attempts) + u16::from(pending.retry_attempts);
+    (pending.auto_retry && !pending.is_system && resends > 0)
+        .then(|| format!("✓ Resending your message (attempt {})...", resends + 1))
+}
+
 pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) -> bool {
     app.refresh_terminal_title_metrics();
     crate::tui::ui::set_frame_input_attribution(crate::tui::ui::FrameInputAttribution {
@@ -238,36 +249,30 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
             // An account change already announced this resend; do not also
             // claim the old account's limit reset.
             if !account_change_resend {
-                let status =
-                    if pending.auto_retry && !pending.is_system && pending.retry_attempts > 0 {
-                        // A turn the user typed, held after a transient failure
-                        // (provider overload): say plainly that their message is
-                        // being sent again.
-                        format!(
-                            "✓ Resending your message (attempt {})...",
-                            pending.retry_attempts + 1
-                        )
-                    } else if pending.auto_retry {
-                        format!(
-                            "✓ Retrying continuation...{}",
-                            if pending.is_system {
-                                " (system message)"
-                            } else {
-                                ""
-                            }
-                        )
-                    } else {
-                        format!(
-                            "✓ Rate limit reset. Retrying...{}",
-                            if pending.is_system {
-                                " (system message)"
-                            } else {
-                                ""
-                            }
-                        )
-                    };
+                let status = if let Some(notice) = held_user_turn_resend_notice(&pending) {
+                    notice
+                } else if pending.auto_retry {
+                    format!(
+                        "✓ Retrying continuation...{}",
+                        if pending.is_system {
+                            " (system message)"
+                        } else {
+                            ""
+                        }
+                    )
+                } else {
+                    format!(
+                        "✓ Rate limit reset. Retrying...{}",
+                        if pending.is_system {
+                            " (system message)"
+                        } else {
+                            ""
+                        }
+                    )
+                };
                 app.push_display_message(DisplayMessage::system(status));
             }
+            let overload_attempts = pending.overload_attempts;
             let _ = begin_remote_send(
                 app,
                 remote,
@@ -279,6 +284,11 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
                 pending.retry_attempts,
             )
             .await;
+            // The overload budget belongs to this turn: carry it across the
+            // resend so it stops after OVERLOAD_RETRY_MAX_ATTEMPTS resends.
+            if let Some(resent) = app.rate_limit_pending_message.as_mut() {
+                resent.overload_attempts = overload_attempts;
+            }
             return true;
         }
     }
