@@ -1583,7 +1583,7 @@ pub struct App {
     cleared_draft_images: Vec<(usize, Vec<(String, String)>)>,
     /// Anchor (byte offset into `input`) of the editable composer selection;
     /// the other end is `cursor_pos`. `None` means no selection.
-    input_selection_anchor: Option<usize>,
+    input_selection_anchor: Option<input_selection::InputSelectionAnchor>,
     /// Derives double/triple clicks for word/line selection in the composer.
     input_selection_clicks: input_selection::ClickCounter,
     // Draft replaced by an explicit jump into prompt history (Ctrl+Up),
