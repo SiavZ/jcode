@@ -445,6 +445,7 @@ fn history_refresh_same_session_clears_optimal_baseline() {
         resolved_credential: None,
         reasoning_effort: None,
         service_tier: None,
+        account_labels: Vec::new(),
         compaction_mode: crate::config::CompactionMode::Reactive,
         activity: None,
         side_panel: crate::side_panel::SidePanelSnapshot::default(),
