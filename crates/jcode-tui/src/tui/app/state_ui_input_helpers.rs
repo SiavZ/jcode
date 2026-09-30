@@ -1776,6 +1776,7 @@ impl App {
 
     pub(super) fn undo_input_change(&mut self) {
         let depth = self.input_undo_stack.len();
+        self.input_selection_anchor = None;
         if let Some((input, cursor_pos)) = self.input_undo_stack.pop() {
             let image_count = self.input_undo_image_counts.pop();
             // The composer now holds a restored draft, so the copy stashed by a

@@ -77,6 +77,7 @@ mod inline_interactive;
 pub(crate) use inline_interactive::{model_picker_active_provider, split_model_picker_filter};
 mod input;
 mod input_help;
+mod input_selection;
 mod local;
 mod misc_ui;
 mod model_context;
@@ -1580,6 +1581,11 @@ pub struct App {
     /// Attachments discarded by each Ctrl+C draft clear, keyed by the undo
     /// depth of that clear's snapshot, so Ctrl+Z restores images with text.
     cleared_draft_images: Vec<(usize, Vec<(String, String)>)>,
+    /// Anchor (byte offset into `input`) of the editable composer selection;
+    /// the other end is `cursor_pos`. `None` means no selection.
+    input_selection_anchor: Option<usize>,
+    /// Derives double/triple clicks for word/line selection in the composer.
+    input_selection_clicks: input_selection::ClickCounter,
     // Draft replaced by an explicit jump into prompt history (Ctrl+Up),
     // restored when Down walks back past the newest entry
     history_draft: Option<(String, usize)>,
