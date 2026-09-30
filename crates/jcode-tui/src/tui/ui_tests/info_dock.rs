@@ -35,7 +35,13 @@ fn dock_data() -> info_widget::InfoWidgetData {
             behind: 162,
             untracked: 1,
             staged: 0,
-            dirty_files: vec!["crates/jcode-tui/src/tui/ui.rs".to_string()],
+            dirty_files: vec![info_widget::DirtyFile {
+                status: 'M',
+                path: "crates/jcode-tui/src/tui/ui.rs".to_string(),
+                ..Default::default()
+            }],
+            dirty_total: 1,
+            ..Default::default()
         }),
         ..Default::default()
     }

@@ -93,7 +93,8 @@ impl Provider for OpenAIProvider {
                 .await;
         }
 
-        let input = build_responses_input(messages);
+        let mut input = build_responses_input(messages);
+        insert_additional_tools(&mut input, messages, tools);
         let input_item_count = input.len();
         // Pick up an account switch or relogin before anything reads the
         // cached credential, so a persistent websocket bound to the previous
@@ -737,6 +738,11 @@ impl Provider for OpenAIProvider {
 
     fn supports_image_input(&self) -> bool {
         !is_chatgpt_web_model(&self.model())
+    }
+
+    fn supports_deferred_tools(&self) -> bool {
+        let model = self.model();
+        !is_chatgpt_web_model(&model) && model_supports_additional_tools(&model)
     }
 
     fn set_model(&self, model: &str) -> Result<()> {

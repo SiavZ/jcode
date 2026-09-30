@@ -60,18 +60,215 @@ fn overview_has_content(data: &InfoWidgetData) -> bool {
 
 /// Every overview line at `inner` width. Unlike the floating Overview there is
 /// no paging: the dock shows all sections at once.
+///
+/// The floating Overview is a detail layer only (model, context, and branch
+/// live on the status line). The dock is a fixed summary panel, so it leads
+/// with those identity facts before the detail sections.
 fn overview_lines(data: &InfoWidgetData, inner: Rect) -> Vec<Line<'static>> {
     let mut overview = data.clone();
     overview.memory_info = None;
     overview.diagrams.clear();
-    render_sections(&overview, inner, Some(InfoPageKind::TodosExpanded))
+    let mut lines = identity_lines(data, inner.width);
+    lines.extend(render_sections(
+        &overview,
+        inner,
+        Some(InfoPageKind::TodosExpanded),
+    ));
+    lines
+}
+
+/// Model and effort, provider and auth, context bar, and branch.
+fn identity_lines(data: &InfoWidgetData, width: u16) -> Vec<Line<'static>> {
+    let max = usize::from(width);
+    let mut lines = Vec::new();
+    if let Some(model) = data.model.as_deref().filter(|m| !m.trim().is_empty()) {
+        let mut spans = vec![Span::styled(
+            truncate_smart(
+                &crate::tui::session_facts::pretty_model(model),
+                max.saturating_sub(8),
+            ),
+            Style::default().fg(rgb(255, 150, 200)).bold(),
+        )];
+        if let Some(effort) = data
+            .reasoning_effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+        {
+            spans.push(Span::styled(
+                format!(" ({effort})"),
+                Style::default().fg(rgb(255, 200, 100)),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    let mut detail = Vec::new();
+    if let Some(provider) = data
+        .provider_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        detail.push(Span::styled(
+            provider.to_lowercase(),
+            Style::default().fg(rgb(140, 180, 255)),
+        ));
+    }
+    if let Some(auth) = auth_label(data.auth_method) {
+        if !detail.is_empty() {
+            detail.push(Span::styled(" · ", Style::default().fg(rgb(80, 80, 90))));
+        }
+        detail.push(Span::styled(auth, Style::default().fg(rgb(140, 140, 150))));
+    }
+    if !detail.is_empty() {
+        lines.push(Line::from(detail));
+    }
+
+    if let Some(line) = context_line(data, width) {
+        lines.push(line);
+    }
+
+    if let Some(info) = data
+        .git_info
+        .as_ref()
+        .filter(|g| !g.branch.trim().is_empty())
+    {
+        lines.push(branch_line(info, max));
+    }
+    lines
+}
+
+fn auth_label(method: AuthMethod) -> Option<&'static str> {
+    match method {
+        AuthMethod::Unknown => None,
+        AuthMethod::AnthropicOAuth
+        | AuthMethod::OpenAIOAuth
+        | AuthMethod::CopilotOAuth
+        | AuthMethod::GeminiOAuth => Some("🔐 OAuth"),
+        AuthMethod::ApiKey
+        | AuthMethod::AnthropicApiKey
+        | AuthMethod::OpenAIApiKey
+        | AuthMethod::OpenRouterApiKey
+        | AuthMethod::OpenCodeApiKey => Some("🔑 API Key"),
+    }
+}
+
+/// `Context 236k/1000k ▰▰▱▱…`, or `None` before any context is known.
+fn context_line(data: &InfoWidgetData, width: u16) -> Option<Line<'static>> {
+    let label = if data.is_compacting {
+        "Context📦"
+    } else {
+        "Context"
+    };
+    if data.context_info_stale {
+        return Some(Line::from(vec![
+            Span::styled(format!("{label} "), Style::default().fg(rgb(140, 140, 150))),
+            Span::styled("updating...", Style::default().fg(rgb(220, 180, 80))),
+        ]));
+    }
+    let used = match (data.observed_context_tokens, data.context_info.as_ref()) {
+        (Some(tokens), _) => tokens as usize,
+        (None, Some(info)) if info.total_chars > 0 => info.estimated_tokens(),
+        _ => return None,
+    };
+    let limit = data
+        .context_limit
+        .unwrap_or(crate::provider::DEFAULT_CONTEXT_LIMIT)
+        .max(1);
+    let k = |t: usize| {
+        if t >= 1000 {
+            format!("{}k", t / 1000)
+        } else {
+            t.to_string()
+        }
+    };
+    let tokens = format!("{}/{}", k(used), k(limit));
+    let used_pct = ((used as f64 / limit as f64) * 100.0)
+        .round()
+        .clamp(0.0, 100.0) as u8;
+    let left_pct = 100u8.saturating_sub(used_pct);
+    let color = if left_pct <= 20 {
+        rgb(255, 100, 100)
+    } else if left_pct <= 50 {
+        rgb(255, 200, 100)
+    } else {
+        rgb(100, 200, 100)
+    };
+    let mut spans = vec![
+        Span::styled(format!("{label} "), Style::default().fg(rgb(140, 140, 150))),
+        Span::styled(format!("{tokens} "), Style::default().fg(color).bold()),
+    ];
+    let fixed = UnicodeWidthStr::width(label) + 1 + tokens.len() + 1;
+    let bar = usize::from(width).saturating_sub(fixed).min(24);
+    if bar >= 3 {
+        let filled = ((used as f64 / limit as f64) * bar as f64).round() as usize;
+        let filled = filled.min(bar);
+        spans.push(Span::styled("▰".repeat(filled), Style::default().fg(color)));
+        spans.push(Span::styled(
+            "▱".repeat(bar - filled),
+            Style::default().fg(rgb(50, 50, 60)),
+        ));
+    }
+    Some(Line::from(spans))
+}
+
+/// Branch with ahead/behind and local change counts.
+fn branch_line(info: &GitInfo, max: usize) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(" ", Style::default().fg(rgb(240, 160, 60))),
+        Span::styled(
+            truncate_smart(&info.branch, max.saturating_sub(24).max(6)),
+            Style::default().fg(rgb(160, 160, 170)),
+        ),
+    ];
+    for (count, sign, color) in [
+        (info.ahead, "↑", rgb(100, 200, 100)),
+        (info.behind, "↓", rgb(255, 140, 100)),
+        (info.modified, "~", rgb(240, 200, 80)),
+        (info.staged, "+", rgb(100, 200, 100)),
+        (info.untracked, "?", rgb(140, 140, 150)),
+    ] {
+        if count > 0 {
+            spans.push(Span::styled(
+                format!(" {sign}{count}"),
+                Style::default().fg(color),
+            ));
+        }
+    }
+    Line::from(spans)
 }
 
 fn section_lines(kind: WidgetKind, data: &InfoWidgetData, inner: Rect) -> Vec<Line<'static>> {
     match kind {
         WidgetKind::Overview => overview_lines(data, inner),
-        other => render_widget_content(other, data, inner),
+        other => inline_frame(render_widget_content(other, data, inner), inner.width),
     }
+}
+
+/// The floating layout draws a widget's header, overflow counts, and legends
+/// on its own border. Docked sections share one box, so that border text
+/// becomes a header row above the body and a footer row below it.
+fn inline_frame(framed: frame::Framed, width: u16) -> Vec<Line<'static>> {
+    fn join(left: Option<Line<'static>>, right: Option<Line<'static>>) -> Option<Line<'static>> {
+        match (left, right) {
+            (None, None) => None,
+            (Some(line), None) | (None, Some(line)) => Some(line),
+            (Some(left), Some(right)) => {
+                let mut spans = left.spans;
+                spans.push(Span::raw(" "));
+                spans.extend(right.spans);
+                Some(Line::from(spans))
+            }
+        }
+    }
+    let width = usize::from(width);
+    let fit = |line: Line<'static>| frame::fit(&line, width).unwrap_or(line);
+    let mut lines = Vec::with_capacity(framed.lines.len() + 2);
+    lines.extend(join(framed.title, framed.title_right).map(fit));
+    lines.extend(framed.lines);
+    lines.extend(join(framed.footer, framed.footer_right).map(fit));
+    lines
 }
 
 /// Docked column width for this terminal and content, or `None` when the
