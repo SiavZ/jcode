@@ -856,6 +856,7 @@ fn remote_app_with_failed_turn() -> App {
         auto_retry: false,
         retry_attempts: 0,
         retry_at: None,
+        overload_attempts: 0,
     });
     app
 }
