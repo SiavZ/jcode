@@ -322,6 +322,7 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             account,
             make_default,
             no_browser,
+            claude_code,
             print_auth_url,
             callback_url,
             auth_code,
@@ -347,6 +348,7 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
                 account.as_deref(),
                 login::LoginOptions {
                     no_browser,
+                    claude_code,
                     print_auth_url,
                     callback_url,
                     auth_code,
