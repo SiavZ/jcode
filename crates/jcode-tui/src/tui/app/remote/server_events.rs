@@ -1321,18 +1321,20 @@ pub(in crate::tui::app) fn handle_server_event(
                 return false;
             }
             app.refresh_openai_usage_after_quota_error(&message);
-            let invalid_tool_calls_exhausted = message.starts_with("Invalid tool calls:");
+            let invalid_tool_calls_exhausted =
+                message.starts_with(crate::agent::Agent::MALFORMED_TOOL_CALL_ERROR_PREFIX);
             // A server-initiated turn (scheduled task, swarm wake, DM) hit a
             // usage limit and the server will resume it at the reset. Settle
             // the adopted turn and say when it resumes. This client did not
             // send the turn, so it must not hold or resend anything itself.
             // Only the explicit `server_resumes` flag means that: an id-0
             // error with just a retry hint is terminal and shown normally.
-            if server_resumes
+            if !invalid_tool_calls_exhausted
+                && server_resumes
                 && app.current_message_id.is_none()
                 && let Some(resume_in) = retry_after_secs
             {
-                app.handle_server_owned_usage_limit_resume(resume_in);
+                app.handle_server_owned_usage_limit_resume(resume_in.min(24 * 60 * 60));
                 remote.reset_call_output_tokens_seen();
                 return true;
             }
@@ -1368,7 +1370,7 @@ pub(in crate::tui::app) fn handle_server_event(
             let reset_duration = (!invalid_tool_calls_exhausted)
                 .then(|| {
                     retry_after_secs
-                        .map(Duration::from_secs)
+                        .map(|secs| Duration::from_secs(secs.min(24 * 60 * 60)))
                         .or_else(|| parse_rate_limit_error(&message))
                 })
                 .flatten();
@@ -1502,6 +1504,21 @@ pub(in crate::tui::app) fn handle_server_event(
             if is_connectivity_error
                 && app.schedule_pending_remote_network_wait_with_force(&message, true)
             {
+                return false;
+            }
+            if is_connectivity_error {
+                // Generic connectivity can be healthy while this provider's
+                // DNS remains broken. Do not let auto-poke reset the budget.
+                crate::tui::app::commands::disable_auto_poke(app);
+                app.overnight_auto_poke = None;
+                app.clear_pending_remote_retry();
+                app.restore_failed_input_to_box();
+                app.push_display_message(DisplayMessage::system(format!(
+                    "Connection retry limit reached after {} automatic resumes. Your progress is saved. Check the provider endpoint or DNS, then re-send the message or switch with /model.",
+                    App::AUTO_RETRY_MAX_ATTEMPTS
+                )));
+                app.set_status_notice("Paused: provider connection did not recover");
+                app.offer_fallback_after_error_with_payload(&message, failed_fallback_payload);
                 return false;
             }
             // Provider overload (5xx, 529 "heavy usage, try again in a

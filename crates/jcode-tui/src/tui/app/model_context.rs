@@ -845,23 +845,24 @@ impl App {
         let error = error.into();
         self.refresh_openai_usage_after_quota_error(&error);
         self.last_stream_error = Some(error.clone());
+        if error.starts_with(crate::agent::Agent::MALFORMED_TOOL_CALL_ERROR_PREFIX) {
+            // The agent already used its schema-guided recovery attempts.
+            // Auto-poke must not start a new turn and reset that circuit breaker.
+            super::commands::disable_auto_poke(self);
+            self.overnight_auto_poke = None;
+            self.clear_pending_remote_retry();
+            self.restore_failed_input_to_box();
+            self.push_display_message(DisplayMessage::error(error));
+            self.set_status_notice("Paused: invalid tool arguments");
+            return;
+        }
+
         // A usage limit with a known reset is a pause: hold the turn and run
         // it again after the reset (local mode).
         if self.hold_local_turn_for_usage_limit(&error) {
             return;
         }
         self.restore_failed_input_to_box();
-
-        if error.starts_with("Invalid tool calls:") {
-            // The agent already used its schema-guided recovery attempts.
-            // Auto-poke must not start a new turn and reset that circuit breaker.
-            super::commands::disable_auto_poke(self);
-            self.overnight_auto_poke = None;
-            self.clear_pending_remote_retry();
-            self.push_display_message(DisplayMessage::error(error));
-            self.set_status_notice("Paused: invalid tool arguments");
-            return;
-        }
 
         if let Some(prompt) = crate::provider::parse_failover_prompt_message(&error) {
             self.handle_provider_failover_prompt(prompt);
