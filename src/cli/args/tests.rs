@@ -1249,3 +1249,27 @@ fn global_account_flag_applies_to_run() {
         "one pin per provider, run's value first"
     );
 }
+
+#[test]
+fn claude_login_oauth_flag_parses_and_conflicts_with_claude_code() {
+    let args = Args::try_parse_from(["jcode", "login", "--provider", "claude", "--oauth"]).unwrap();
+    assert!(matches!(
+        args.command,
+        Some(Command::Login {
+            oauth: true,
+            claude_code: false,
+            ..
+        })
+    ));
+    assert!(
+        Args::try_parse_from([
+            "jcode",
+            "login",
+            "--provider",
+            "claude",
+            "--oauth",
+            "--claude-code",
+        ])
+        .is_err()
+    );
+}

@@ -323,6 +323,7 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             make_default,
             no_browser,
             claude_code,
+            oauth,
             print_auth_url,
             callback_url,
             auth_code,
@@ -337,6 +338,25 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             api_key_env,
         }) => {
             let login_choice = login_provider.unwrap_or(args.provider);
+            // Claude Code accounts sign in through the installed CLI by
+            // default. Only when that path is valid for this call: Jcode
+            // OAuth stays for account labels, --default, browserless and
+            // scriptable flows, non-interactive shells, and `--oauth`.
+            let claude_code = claude_code
+                || (!oauth
+                    && matches!(login_choice, provider_init::ProviderChoice::Claude)
+                    && account.is_none()
+                    && !make_default
+                    && !no_browser
+                    && !json
+                    && !print_auth_url
+                    && !complete
+                    && callback_url.is_none()
+                    && auth_code.is_none()
+                    && flow_id.is_none()
+                    && !cancel
+                    && crate::external_auth::can_prompt_for_external_auth()
+                    && auth::claude::prefer_claude_code_cli_login());
             let default_family = match &login_choice {
                 provider_init::ProviderChoice::Claude => Some("claude"),
                 provider_init::ProviderChoice::Openai => Some("openai"),
