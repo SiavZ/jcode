@@ -70,6 +70,7 @@ fn create_visible_spawn_session(
     provider_key_override: Option<&str>,
     route_api_method_override: Option<&str>,
     effort_override: Option<&str>,
+    accounts: &crate::session_accounts::AccountInheritance,
     selfdev_requested: bool,
 ) -> anyhow::Result<(String, PathBuf)> {
     let cwd = working_dir
@@ -96,10 +97,16 @@ fn create_visible_spawn_session(
         // headed client attaches to this session.
         session.reasoning_effort = Some(effort.to_string());
     }
+    // Restored by `restore_account_pins_from_session` when the headed client
+    // attaches, like the model and effort above.
+    accounts.apply_to_session(&mut session);
     if selfdev_requested {
         session.set_canary("self-dev");
     }
-    session.save()?;
+    // The headed client attaches in a separate process and must find the
+    // prepared model/provider/effort on disk, so bypass the untouched-session
+    // save gate from 783c979a0.
+    session.save_prepared()?;
 
     Ok((session.id.clone(), cwd))
 }
@@ -212,6 +219,8 @@ pub(super) struct CoordinatorSpawnIdentity {
     pub provider_key: Option<String>,
     pub route_api_method: Option<String>,
     pub is_canary: bool,
+    /// Account pins and failover toggle the worker inherits.
+    pub accounts: crate::session_accounts::AccountInheritance,
 }
 
 /// The resolved model + auth route a spawned swarm agent should be created
@@ -244,6 +253,7 @@ async fn resolve_coordinator_spawn_identity(
             provider_key: agent_guard.session_provider_key(),
             route_api_method: agent_guard.session_route_api_method(),
             is_canary: agent_guard.is_canary(),
+            accounts: agent_guard.account_inheritance(),
         };
     }
 
@@ -256,6 +266,7 @@ async fn resolve_coordinator_spawn_identity(
                 provider_key: session.provider_key.clone(),
                 route_api_method: session.route_api_method.clone(),
                 is_canary: session.is_canary,
+                accounts: crate::session_accounts::AccountInheritance::from_session(&session),
             };
             crate::logging::info(&format!(
                 "Swarm spawn: coordinator {} agent busy/unavailable, inheriting identity from persisted session (model={:?} provider_key={:?} route={:?} canary={})",
@@ -363,6 +374,24 @@ fn selection_for_concrete_model(
     }
 }
 
+async fn session_swarm_model(
+    req_session_id: &str,
+    sessions: &SessionAgents,
+    global: Option<String>,
+) -> Option<String> {
+    let agent = sessions.read().await.get(req_session_id).cloned();
+    if let Some(agent) = agent
+        && let Ok(guard) = agent.try_lock()
+    {
+        return guard
+            .session_for_split()
+            .effective_agent_model("swarm", global);
+    }
+    Session::load_startup_stub(req_session_id)
+        .map(|session| session.effective_agent_model("swarm", global.clone()))
+        .unwrap_or(global)
+}
+
 fn resolve_swarm_spawn_selection(
     requested_model: Option<String>,
     configured_swarm_model: Option<String>,
@@ -431,6 +460,7 @@ fn prepare_visible_spawn_session<F>(
     provider_key_override: Option<&str>,
     route_api_method_override: Option<&str>,
     effort_override: Option<&str>,
+    accounts: &crate::session_accounts::AccountInheritance,
     selfdev_requested: bool,
     startup_message: Option<&str>,
     launch_visible: F,
@@ -445,6 +475,7 @@ where
         provider_key.as_deref(),
         route_api_method_override,
         effort_override,
+        accounts,
         selfdev_requested,
     )?;
 
@@ -549,10 +580,6 @@ async fn register_visible_spawned_member(
     broadcast_swarm_status(swarm_id, swarm_members, swarms_by_id).await;
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "server-side swarm spawning needs session, swarm state, provider, and event sinks together"
-)]
 /// Resolve the reasoning effort for a spawned swarm worker (#1165).
 ///
 /// Precedence mirrors the model path: an explicit `effort` on the spawn call
@@ -571,6 +598,10 @@ pub(super) fn resolve_swarm_spawn_effort(
     clean(requested_effort).or_else(|| clean(configured_swarm_effort))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "server-side swarm spawning needs session, swarm state, provider, and event sinks together"
+)]
 pub(super) async fn spawn_swarm_agent(
     req_session_id: &str,
     swarm_id: &str,
@@ -603,8 +634,9 @@ pub(super) async fn spawn_swarm_agent(
     // startup env (#405).
     let client_terminal_env =
         client_terminal_env_for_session(req_session_id, client_connections).await;
-    let agents_config = &crate::config::config().agents;
-    let configured_swarm_model = agents_config.swarm_model.clone();
+    let agents_config = &crate::config::Config::load().agents;
+    let configured_swarm_model =
+        session_swarm_model(req_session_id, sessions, agents_config.swarm_model.clone()).await;
     let resolved_spawn_mode = spawn_mode.unwrap_or(agents_config.swarm_spawn_mode);
     let selection = resolve_swarm_spawn_selection(
         requested_model.clone(),
@@ -648,6 +680,7 @@ pub(super) async fn spawn_swarm_agent(
             spawn_provider_key.as_deref(),
             spawn_route_api_method.as_deref(),
             spawn_effort.as_deref(),
+            &coordinator.accounts,
             coordinator_is_canary,
             startup_message.as_deref(),
             |session_id, cwd, selfdev_requested, provider_key| {
@@ -691,6 +724,7 @@ pub(super) async fn spawn_swarm_agent(
                 spawn_provider_key.clone(),
                 spawn_route_api_method.clone(),
                 spawn_effort.clone(),
+                coordinator.accounts.clone(),
                 Some(Arc::clone(mcp_pool)),
                 Some(req_session_id.to_string()),
                 super::headless::HeadlessMemoryScope::RealProject,
@@ -995,7 +1029,12 @@ pub(super) async fn handle_comm_list_models(
     send_event(ServerEvent::CommListModelsResponse {
         id,
         current_model: coordinator.model,
-        configured_swarm_model: crate::config::config().agents.swarm_model.clone(),
+        configured_swarm_model: session_swarm_model(
+            req_session_id,
+            sessions,
+            crate::config::Config::load().agents.swarm_model,
+        )
+        .await,
         model_routes,
     });
 }
@@ -1036,6 +1075,7 @@ pub(super) async fn handle_comm_stop(
             id,
             message: "Not in a swarm.".to_string(),
             retry_after_secs: None,
+            server_resumes: false,
         });
         return;
     };
@@ -1048,6 +1088,7 @@ pub(super) async fn handle_comm_stop(
                     id,
                     message,
                     retry_after_secs: None,
+                    server_resumes: false,
                 });
                 return;
             }
@@ -1075,6 +1116,7 @@ pub(super) async fn handle_comm_stop(
                 "Refusing to stop session '{target_session}' because it was not spawned by this coordinator. Pass force=true to stop a non-owned/user-created swarm session explicitly."
             ),
             retry_after_secs: None,
+            server_resumes: false,
         });
         return;
     }
@@ -1340,6 +1382,7 @@ async fn ensure_spawn_coordinator_swarm(
             id,
             message: "Not in a swarm.".to_string(),
             retry_after_secs: None,
+            server_resumes: false,
         });
         return None;
     };
@@ -1359,6 +1402,7 @@ async fn ensure_spawn_coordinator_swarm(
                     "Recursive swarm spawning is disabled for light and ad hoc swarms. Only the root session ({root_session_id}) may spawn agents unless that root is running in swarm-deep mode."
                 ),
                 retry_after_secs: None,
+                server_resumes: false,
             });
             return None;
         }
@@ -1373,6 +1417,7 @@ async fn ensure_spawn_coordinator_swarm(
                 super::MAX_SWARM_MEMBERS
             ),
             retry_after_secs: None,
+            server_resumes: false,
         });
         return None;
     }
@@ -1390,6 +1435,7 @@ async fn ensure_spawn_coordinator_swarm(
                 "Swarm live-agent limit reached (max {limit}, configured by agents.swarm_max_concurrent_agents). This swarm already has {live_spawned_agent_count} active spawned agents. Let existing agents finish or stop them before spawning more."
             ),
             retry_after_secs: None,
+            server_resumes: false,
         });
         return None;
     }

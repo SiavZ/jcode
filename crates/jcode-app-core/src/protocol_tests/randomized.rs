@@ -63,6 +63,7 @@ fn test_protocol_request_roundtrip_randomized_samples() -> Result<()> {
         let crash_on_disconnect = rng.random_bool(0.5);
         let continue_on_disconnect = rng.random_bool(0.5);
         let req = Request::Subscribe {
+            system_prompt: None,
             supports_pdf_panels: false,
             id,
             working_dir: working_dir.clone(),
@@ -74,9 +75,12 @@ fn test_protocol_request_roundtrip_randomized_samples() -> Result<()> {
             crash_on_disconnect,
             continue_on_disconnect,
             terminal_env: Vec::new(),
+            account_pins: Vec::new(),
+            supports_session_accounts: false,
         };
         let decoded = parse_request_json(&serde_json::to_string(&req)?)?;
         let Request::Subscribe {
+            system_prompt: _,
             supports_pdf_panels: _,
             id: decoded_id,
             working_dir: decoded_working_dir,
@@ -88,6 +92,8 @@ fn test_protocol_request_roundtrip_randomized_samples() -> Result<()> {
             crash_on_disconnect: decoded_crash_on_disconnect,
             continue_on_disconnect: decoded_continue_on_disconnect,
             terminal_env: _,
+            account_pins: _,
+            supports_session_accounts: _,
         } = decoded
         else {
             return Err(anyhow!("expected randomized Subscribe"));

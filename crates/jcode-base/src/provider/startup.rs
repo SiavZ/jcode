@@ -60,28 +60,6 @@ impl MultiProvider {
         });
     }
 
-    pub(super) async fn invalidate_provider_credentials_for_account_switch(
-        &self,
-        provider: ActiveProvider,
-    ) {
-        match provider {
-            ActiveProvider::Claude => {
-                if let Some(anthropic) = self.anthropic_provider() {
-                    anthropic.invalidate_credentials().await;
-                }
-                if let Some(claude) = self.claude_provider() {
-                    claude.invalidate_credentials().await;
-                }
-            }
-            ActiveProvider::OpenAI => {
-                if let Some(openai) = self.openai_provider() {
-                    openai.invalidate_credentials().await;
-                }
-            }
-            _ => {}
-        }
-    }
-
     pub(super) fn new_with_auth_status(auth_status: auth::AuthStatus) -> Self {
         let provider_init_start = std::time::Instant::now();
         let cfg = crate::config::config();
@@ -127,25 +105,13 @@ impl MultiProvider {
         let has_bedrock_creds = bedrock::BedrockProvider::has_credentials();
         let has_openrouter_creds = openrouter::has_credentials();
 
-        let use_claude_cli = std::env::var("JCODE_USE_CLAUDE_CLI")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if use_claude_cli {
+        if std::env::var_os("JCODE_USE_CLAUDE_CLI").is_some() {
             crate::logging::warn(
-                "JCODE_USE_CLAUDE_CLI is deprecated and will be removed. Direct Anthropic API transport is the default.",
+                "JCODE_USE_CLAUDE_CLI has been removed and is ignored. Claude uses the direct Anthropic transport.",
             );
         }
 
-        let claude = if has_claude_creds && use_claude_cli {
-            crate::logging::info(
-                "Using deprecated Claude CLI provider (forced by JCODE_USE_CLAUDE_CLI=1)",
-            );
-            external::instantiate_expected_external_provider(external::CLAUDE_CLI_RUNTIME)
-        } else {
-            None
-        };
-
-        let anthropic = if has_claude_creds && !use_claude_cli {
+        let anthropic = if has_claude_creds {
             let provider =
                 external::instantiate_expected_external_provider(external::ANTHROPIC_RUNTIME);
             let active_profile_is_anthropic = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
@@ -256,7 +222,7 @@ impl MultiProvider {
         );
         let availability = ProviderAvailability {
             openai: openai.is_some(),
-            claude: claude.is_some() || anthropic.is_some(),
+            claude: anthropic.is_some(),
             copilot: copilot_api.is_some(),
             antigravity: antigravity_provider.is_some(),
             gemini: gemini_provider.is_some(),
@@ -323,7 +289,6 @@ impl MultiProvider {
         }
 
         let result = Self {
-            claude: RwLock::new(claude),
             anthropic: RwLock::new(anthropic),
             openai: RwLock::new(openai),
             copilot_api: RwLock::new(copilot_api),
@@ -335,11 +300,11 @@ impl MultiProvider {
             openai_compatible_profiles: RwLock::new(HashMap::new()),
             active_openai_compatible_profile: RwLock::new(None),
             active: RwLock::new(active),
-            use_claude_cli,
             startup_notices: RwLock::new(Vec::new()),
             initial_provider,
             routes_memo: Mutex::new(None),
             post_auth_refreshes_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            account_failover: Default::default(),
         };
 
         // An explicit CLI/environment provider selection owns startup routing.
@@ -362,14 +327,8 @@ impl MultiProvider {
 
         result.spawn_anthropic_catalog_refresh_if_needed();
         result.spawn_openai_catalog_refresh_if_needed();
-        result.auto_select_active_multi_account();
         crate::logging::info(&format!(
-            "[TIMING] provider_init: claude={}, anthropic={}, openai={}, copilot={}, antigravity={}, gemini={}, cursor={}, bedrock={}, openrouter={}, total={}ms",
-            result
-                .claude
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_some(),
+            "[TIMING] provider_init: anthropic={}, openai={}, copilot={}, antigravity={}, gemini={}, cursor={}, bedrock={}, openrouter={}, total={}ms",
             result
                 .anthropic
                 .read()
@@ -435,26 +394,28 @@ impl MultiProvider {
     }
 
     pub(super) fn spawn_anthropic_catalog_refresh_if_needed(&self) {
-        let provider: Arc<dyn Provider> = if let Some(anthropic) = self.anthropic_provider() {
-            anthropic
-        } else if let Some(claude) = self.claude_provider() {
-            claude
-        } else {
+        let api_stale = anthropic::load_anthropic_api_key().is_ok()
+            && should_refresh_anthropic_model_catalog_for_scope(
+                &anthropic_catalog_scope_for_route(false),
+            );
+        let oauth_stale = auth::claude::load_credentials().is_ok()
+            && should_refresh_anthropic_model_catalog_for_scope(
+                &anthropic_catalog_scope_for_route(true),
+            );
+        if !api_stale && !oauth_stale {
+            return;
+        }
+        let Some(provider) = self.anthropic_provider() else {
             return;
         };
-
-        let Some(scope) = begin_anthropic_model_catalog_refresh() else {
-            return;
-        };
-
+        // The direct runtime multiplexes API key and OAuth. Its prefetch owns
+        // independent scoped refresh guards, including when invoked elsewhere.
         tokio::spawn(async move {
             if let Err(err) = provider.prefetch_models().await {
                 crate::logging::info(&format!(
-                    "Failed to refresh Anthropic model catalog from provider bootstrap: {}",
-                    err
+                    "Failed to refresh Anthropic model catalogs: {err}"
                 ));
             }
-            finish_anthropic_model_catalog_refresh_for_scope(&scope);
         });
     }
 
@@ -508,100 +469,10 @@ impl MultiProvider {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    pub fn auto_select_active_multi_account(&self) {
-        self.auto_select_multi_account_for_provider(self.active_provider());
-    }
-
-    /// Backward-compatible wrapper for the Anthropic-specific startup rotation entrypoint.
-    pub fn auto_select_anthropic_account(&self) {
-        self.auto_select_multi_account_for_provider(ActiveProvider::Claude);
-    }
-
-    pub fn auto_select_openai_account(&self) {
-        self.auto_select_multi_account_for_provider(ActiveProvider::OpenAI);
-    }
-
-    pub(super) fn auto_select_multi_account_for_provider(&self, provider: ActiveProvider) {
-        if self.active_provider() != provider {
-            return;
-        }
-        if !self.provider_is_configured(provider) {
-            return;
-        }
-        if provider == ActiveProvider::OpenAI {
-            return;
-        }
-
-        let Some(probe) = account_usage_probe(provider) else {
-            return;
-        };
-        if !probe.has_multiple_accounts() || !probe.current_exhausted() {
-            return;
-        }
-
-        let provider_name = probe.provider.display_name();
-        if let Some(alternative) = probe.best_available_alternative() {
-            crate::logging::info(&format!(
-                "{} account '{}' is exhausted, switching to '{}' ({})",
-                provider_name,
-                probe.current_label,
-                alternative.label,
-                alternative.summary()
-            ));
-
-            match provider {
-                ActiveProvider::Claude => {
-                    crate::auth::claude::set_active_account_override(Some(
-                        alternative.label.clone(),
-                    ));
-                    clear_all_provider_unavailability_for_account();
-                    clear_all_model_unavailability_for_account();
-                    if let Some(anthropic) = self.anthropic_provider() {
-                        tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current()
-                                .block_on(anthropic.invalidate_credentials())
-                        });
-                    }
-                }
-                ActiveProvider::OpenAI => {
-                    crate::auth::codex::set_active_account_override(Some(
-                        alternative.label.clone(),
-                    ));
-                    clear_all_provider_unavailability_for_account();
-                    clear_all_model_unavailability_for_account();
-                    if let Some(openai) = self.openai_provider() {
-                        tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current()
-                                .block_on(openai.invalidate_credentials())
-                        });
-                    }
-                }
-                _ => return,
-            }
-
-            let notice = format!(
-                "⚡ Auto-switched {} account: **{}** -> **{}** (previous account exhausted)",
-                provider_name, probe.current_label, alternative.label
-            );
-            self.startup_notices
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(notice);
-            return;
-        }
-
-        if probe.all_accounts_exhausted() {
-            crate::logging::info(&format!("All {} accounts are exhausted", provider_name));
-            let notice = format!(
-                "⚠ All {} accounts exhausted - will fall back to other providers if available",
-                provider_name
-            );
-            self.startup_notices
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(notice);
-        }
-    }
+    // Startup no longer auto-selects another account through the process-wide
+    // override: that moved every window. The per-request precheck and
+    // same-provider account failover now move only the session that is out
+    // of usage (see `multi_provider.rs`).
 
     /// Check if Anthropic OAuth usage is exhausted (both 5hr and 7d at 100%)
     pub(super) fn is_claude_usage_exhausted(&self) -> bool {
@@ -609,7 +480,6 @@ impl MultiProvider {
             return false;
         }
 
-        let usage = crate::usage::get_sync();
-        usage.five_hour >= 0.99 && usage.seven_day >= 0.99
+        crate::usage::active_claude_usage_exhausted_sync()
     }
 }

@@ -223,7 +223,7 @@ fn test_anthropic_reasoning_effort_request_parts() {
         provider.build_reasoning_request_parts("claude-sonnet-4-6", true);
 
     match thinking.expect("adaptive thinking should be enabled") {
-        ApiThinking::Adaptive { display } => assert_eq!(display, Some("summarized")),
+        ApiThinking::Adaptive { display, .. } => assert_eq!(display, Some("summarized")),
         ApiThinking::Enabled { .. } => panic!("Claude 4.6 should use adaptive thinking"),
     }
     assert_eq!(
@@ -293,7 +293,7 @@ fn test_anthropic_show_thinking_enables_adaptive_thinking_without_effort() {
     let (thinking, output_config, temperature) =
         provider.build_reasoning_request_parts_inner("claude-sonnet-4-6", true, true);
     match thinking.expect("show_thinking should enable adaptive thinking") {
-        ApiThinking::Adaptive { display } => assert_eq!(display, Some("summarized")),
+        ApiThinking::Adaptive { display, .. } => assert_eq!(display, Some("summarized")),
         ApiThinking::Enabled { .. } => panic!("Sonnet 4.6 should use adaptive thinking"),
     }
     assert!(
@@ -361,7 +361,7 @@ fn test_anthropic_fable_defaults_to_high_effort() {
         "high",
     );
     match thinking.expect("Fable default effort should enable adaptive thinking") {
-        ApiThinking::Adaptive { display } => assert_eq!(display, Some("summarized")),
+        ApiThinking::Adaptive { display, .. } => assert_eq!(display, Some("summarized")),
         ApiThinking::Enabled { .. } => panic!("Fable 5 should use adaptive thinking"),
     }
 
@@ -484,7 +484,7 @@ fn test_anthropic_opus_defaults_to_xhigh_effort() {
         "xhigh",
     );
     match thinking.expect("Opus default effort should enable adaptive thinking") {
-        ApiThinking::Adaptive { display } => assert_eq!(display, Some("summarized")),
+        ApiThinking::Adaptive { display, .. } => assert_eq!(display, Some("summarized")),
         ApiThinking::Enabled { .. } => panic!("Opus 4.8 should use adaptive thinking"),
     }
 
@@ -871,7 +871,7 @@ async fn test_dangling_tool_use_repair() {
         // Missing tool_results for tool_123 and tool_456!
     ];
 
-    let formatted = provider.format_messages(&messages, false);
+    let formatted = provider.format_messages(&messages, false, &[]);
 
     // Should have 3 messages:
     // 1. User: "Hello"
@@ -905,6 +905,71 @@ async fn test_dangling_tool_use_repair() {
     }
     assert!(found_ids.contains("tool_123"));
     assert!(found_ids.contains("tool_456"));
+}
+
+#[tokio::test]
+async fn test_orphaned_tool_result_is_rewritten_as_text() {
+    // Mirrors a real stuck session: the assistant called tool_a, the interrupt
+    // repair answered it, then a late result for a tool_use that is not in the
+    // transcript was persisted right after. Anthropic 400s on that orphan.
+    let provider = AnthropicProvider::new();
+    let msg = |role, content| Message {
+        role,
+        content,
+        timestamp: None,
+        tool_duration_ms: None,
+    };
+    let messages = vec![
+        msg(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "go".to_string(),
+                cache_control: None,
+            }],
+        ),
+        msg(
+            Role::Assistant,
+            vec![ContentBlock::ToolUse {
+                id: "tool_a".to_string(),
+                name: "bash".to_string(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            }],
+        ),
+        msg(
+            Role::User,
+            vec![ContentBlock::ToolResult {
+                tool_use_id: "tool_a".to_string(),
+                content: "ok".to_string(),
+                is_error: None,
+            }],
+        ),
+        msg(
+            Role::User,
+            vec![ContentBlock::ToolResult {
+                tool_use_id: "tool_ghost".to_string(),
+                content: "no leftovers".to_string(),
+                is_error: None,
+            }],
+        ),
+    ];
+
+    let formatted = provider.format_messages(&messages, false, &[]);
+    let last = formatted.last().unwrap();
+    assert_eq!(last.role, "user");
+    assert!(matches!(
+        &last.content[0],
+        ApiContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "tool_a"
+    ));
+    for block in &last.content {
+        if let ApiContentBlock::ToolResult { tool_use_id, .. } = block {
+            assert_ne!(tool_use_id, "tool_ghost");
+        }
+    }
+    assert!(last.content.iter().any(|b| matches!(
+        b,
+        ApiContentBlock::Text { text, .. } if text.contains("tool_ghost") && text.contains("no leftovers")
+    )));
 }
 
 #[tokio::test]
@@ -945,7 +1010,7 @@ async fn test_no_repair_when_tool_results_present() {
         },
     ];
 
-    let formatted = provider.format_messages(&messages, false);
+    let formatted = provider.format_messages(&messages, false, &[]);
 
     // Should have exactly 3 messages (no synthetic ones added)
     assert_eq!(formatted.len(), 3);
@@ -1027,7 +1092,7 @@ async fn test_parallel_image_tool_results_stay_contiguous() {
         make_image_result("tool_c", "c.png"),
     ];
 
-    let formatted = provider.format_messages(&messages, false);
+    let formatted = provider.format_messages(&messages, false, &[]);
 
     // assistant message + merged user tool_result message
     assert_eq!(formatted.len(), 2);
@@ -1568,7 +1633,7 @@ async fn test_sanitize_tool_ids_with_dots() {
         },
     ];
 
-    let formatted = provider.format_messages(&messages, false);
+    let formatted = provider.format_messages(&messages, false, &[]);
 
     let sanitized_id = "chatcmpl-BF2xX_tool_call_0";
     for msg in &formatted {
@@ -1613,7 +1678,7 @@ async fn test_sanitize_dangling_tool_ids_with_dots() {
         },
     ];
 
-    let formatted = provider.format_messages(&messages, false);
+    let formatted = provider.format_messages(&messages, false, &[]);
 
     let sanitized_id = "call_with_dots";
     for msg in &formatted {
@@ -1872,6 +1937,13 @@ fn anthropic_fallback_honors_server_recommendation() {
         "claude-opus-4-8"
     );
 
+    let opus_55 = anthropic_recommended_model_from_error("please use opus 5.5. learn more")
+        .expect("decimal release recommendation should resolve");
+    assert_eq!(
+        AnthropicProvider::normalized_model_key(&opus_55),
+        "claude-opus-5-5"
+    );
+
     // A recommendation pointing at a retired model is ignored (falls through to
     // quality ranking).
     let retired_rec = "model x not available. please use mythos 1.";
@@ -2023,7 +2095,7 @@ fn ping_keepalive_emits_streaming_phase_event() {
 #[test]
 fn test_anthropic_opus_5_low_effort_reaches_the_wire() {
     // Benchmark campaigns pin `claude-opus-5` at `low` effort. Opus 5 also
-    // *defaults* to `low` (jcode's default model/effort pairing), and an
+    // *defaults* to `low`, and an
     // explicit `low` must survive normalization, must NOT be silently
     // promoted, and must land in `output_config.effort` on the request.
     assert!(AnthropicProvider::model_supports_output_effort(
@@ -2032,6 +2104,11 @@ fn test_anthropic_opus_5_low_effort_reaches_the_wire() {
     assert_eq!(
         AnthropicProvider::default_reasoning_effort_for_model("claude-opus-5").as_deref(),
         Some("low"),
+    );
+    // Opus 5.5 is jcode's default Claude model and defaults to `medium`.
+    assert_eq!(
+        AnthropicProvider::default_reasoning_effort_for_model("claude-opus-5-5").as_deref(),
+        Some("medium"),
     );
     assert_eq!(
         AnthropicProvider::normalize_reasoning_effort("low").as_deref(),
@@ -2073,11 +2150,9 @@ fn test_anthropic_opus_5_low_effort_reaches_the_wire() {
 /// `stop_reason: tool_use` with no tool call for the agent to run.
 #[test]
 fn test_anthropic_unknown_content_block_start_does_not_drop_event() {
-    for block_type in [
-        "server_tool_use",
-        "web_search_tool_result",
-        "some_future_block",
-    ] {
+    // Server tool blocks (`server_tool_use`, `web_search_tool_result`) are
+    // captured for replay; see native_web_search_sse_tests.rs.
+    for block_type in ["some_future_block", "code_execution_tool_result_future"] {
         let mut state = SseStreamState::default();
         let event = SseEvent {
             event_type: "content_block_start".to_string(),
@@ -2218,4 +2293,977 @@ fn configured_swarm_root_effort_reads_real_config() {
         }
         assert_eq!(provider.stored_reasoning_effort().as_deref(), Some(mode));
     }
+}
+
+#[test]
+fn opus_55_request_json_supports_api_and_oauth_without_forced_tools() {
+    let provider = AnthropicProvider::new();
+    for model in ["claude-opus-5-5", "claude-fable-5-1"] {
+        for is_oauth in [false, true] {
+            for show_thinking in [false, true] {
+                for effort in [None, Some("none"), Some("low"), Some("xhigh"), Some("max")] {
+                    let (thinking, output_config, temperature) = provider
+                        .build_reasoning_request_parts_with_effort(
+                            model,
+                            is_oauth,
+                            show_thinking,
+                            effort,
+                        );
+                    let request = ApiRequest {
+                        model: model.to_string(),
+                        max_tokens: jcode_provider_core::anthropic::anthropic_max_output_tokens(
+                            model,
+                        ),
+                        system: None,
+                        messages: vec![],
+                        tools: None,
+                        metadata: None,
+                        thinking,
+                        output_config,
+                        temperature,
+                        service_tier: None,
+                        stream: true,
+                    };
+                    let value = serde_json::to_value(&request).unwrap();
+                    assert_eq!(value["thinking"]["type"], "adaptive");
+                    assert_eq!(value["thinking"]["display"], "summarized");
+                    assert_eq!(
+                        value["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+                        "drop_block"
+                    );
+                    assert_eq!(value["max_tokens"], 128_000);
+                    assert!(value.get("temperature").is_none());
+                    assert!(value.get("tool_choice").is_none());
+                    match effort {
+                        None => assert!(value.get("output_config").is_none()),
+                        Some("none") => assert_eq!(value["output_config"]["effort"], "low"),
+                        Some(effort) => assert_eq!(value["output_config"]["effort"], effort),
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn opus_55_empty_signed_thinking_is_replayed_unchanged() {
+    let provider = AnthropicProvider::new();
+    for is_oauth in [false, true] {
+        let blocks = provider.format_content_blocks(
+            &[ContentBlock::AnthropicThinking {
+                thinking: String::new(),
+                signature: "model-and-prefix-bound-signature".to_string(),
+            }],
+            is_oauth,
+        );
+        assert_eq!(
+            serde_json::to_value(blocks).unwrap(),
+            serde_json::json!([{
+                "type": "thinking", "thinking": "", "signature": "model-and-prefix-bound-signature"
+            }])
+        );
+    }
+}
+
+/// Reported 400: "`tool_use` ids were found without `tool_result` blocks
+/// immediately after". The calls do have results, but a message was written
+/// between the call and its results (a user interjection or a reload
+/// continuation), so the results are not in the next message. Every
+/// tool_use must still be answered in the very next user message.
+#[tokio::test]
+async fn test_tool_use_answered_later_still_gets_result_immediately_after() {
+    let provider = AnthropicProvider::new();
+    let msg = |role, content| Message {
+        role,
+        content,
+        timestamp: None,
+        tool_duration_ms: None,
+    };
+    let tool_use = |id: &str| ContentBlock::ToolUse {
+        id: id.to_string(),
+        name: "bash".to_string(),
+        input: serde_json::json!({}),
+        thought_signature: None,
+    };
+    let tool_result = |id: &str| ContentBlock::ToolResult {
+        tool_use_id: id.to_string(),
+        content: format!("output of {id}"),
+        is_error: None,
+    };
+    let text = |t: &str| ContentBlock::Text {
+        text: t.to_string(),
+        cache_control: None,
+    };
+    let messages = vec![
+        msg(Role::User, vec![text("go")]),
+        // The real session: two assistant messages back to back, the second
+        // with its own calls, answered right away; the first message's calls
+        // were answered only after more turns were written.
+        msg(
+            Role::Assistant,
+            vec![text("Checking."), tool_use("tool_a"), tool_use("tool_b")],
+        ),
+        msg(Role::Assistant, vec![tool_use("tool_c")]),
+        msg(Role::User, vec![tool_result("tool_c")]),
+        msg(Role::Assistant, vec![text("Working on it.")]),
+        msg(Role::User, vec![text("also check the logs")]),
+        msg(Role::User, vec![tool_result("tool_b")]),
+        msg(Role::User, vec![tool_result("tool_a")]),
+        msg(Role::Assistant, vec![text("Done.")]),
+    ];
+
+    let formatted = provider.format_messages(&messages, false, &[]);
+    for (i, m) in formatted.iter().enumerate() {
+        let uses: Vec<&String> = m
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ApiContentBlock::ToolUse { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect();
+        if uses.is_empty() {
+            continue;
+        }
+        let next = formatted
+            .get(i + 1)
+            .expect("a message follows every tool_use");
+        assert_eq!(next.role, "user");
+        for id in uses {
+            assert!(
+                next.content.iter().any(|b| matches!(
+                    b,
+                    ApiContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id
+                )),
+                "tool_use {id} has no tool_result immediately after: {}",
+                serde_json::to_string_pretty(&formatted).unwrap()
+            );
+        }
+    }
+    // The real output is not lost.
+    let all_text = serde_json::to_string(&formatted).unwrap();
+    assert!(
+        ["tool_a", "tool_b", "tool_c"]
+            .iter()
+            .all(|id| all_text.contains(&format!("output of {id}")))
+    );
+    // Roles still alternate.
+    assert!(formatted.windows(2).all(|w| w[0].role != w[1].role));
+}
+
+/// A late tool_result must carry the blocks that belong to it (its image, the
+/// image label and any deferred tool reference) when it is moved up, or the
+/// model sees a partial tool output and the reference is dropped.
+fn late_result_conversation(attachments: Vec<ContentBlock>) -> Vec<Message> {
+    let msg = |role, content| Message {
+        role,
+        content,
+        timestamp: None,
+        tool_duration_ms: None,
+    };
+    let text = |t: &str| ContentBlock::Text {
+        text: t.to_string(),
+        cache_control: None,
+    };
+    let mut late = vec![ContentBlock::ToolResult {
+        tool_use_id: "tool_a".to_string(),
+        content: "output of tool_a".to_string(),
+        is_error: None,
+    }];
+    late.extend(attachments);
+    late.push(text("unrelated note"));
+    vec![
+        msg(Role::User, vec![text("go")]),
+        msg(
+            Role::Assistant,
+            vec![ContentBlock::ToolUse {
+                id: "tool_a".to_string(),
+                name: "mcp_search".to_string(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            }],
+        ),
+        msg(Role::User, vec![text("also check the logs")]),
+        msg(Role::Assistant, vec![text("Working on it.")]),
+        msg(Role::User, late),
+        msg(Role::Assistant, vec![text("Done.")]),
+    ]
+}
+
+#[tokio::test]
+async fn test_late_tool_result_moves_with_its_image_and_label() {
+    let provider = AnthropicProvider::new();
+    let label = "[Attached image associated with the preceding tool result: shot.png]";
+    let messages = late_result_conversation(vec![
+        ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: "aW1n".to_string(),
+        },
+        ContentBlock::Text {
+            text: label.to_string(),
+            cache_control: None,
+        },
+    ]);
+    let formatted = provider.format_messages(&messages, false, &[]);
+    let dump = serde_json::to_string_pretty(&formatted).unwrap();
+
+    assert_eq!(formatted[1].role, "assistant");
+    let answer = &formatted[2];
+    assert_eq!(answer.role, "user");
+    let ApiContentBlock::ToolResult {
+        tool_use_id,
+        content: ToolResultContent::Blocks(blocks),
+        ..
+    } = &answer.content[0]
+    else {
+        panic!("result with image blocks must follow the tool_use: {dump}");
+    };
+    assert_eq!(tool_use_id, "tool_a");
+    assert!(
+        matches!(&blocks[..], [
+            ToolResultContentBlock::Text { text: out },
+            ToolResultContentBlock::Image { .. },
+            ToolResultContentBlock::Text { text: l },
+        ] if out == "output of tool_a" && l == label),
+        "image and label must sit right after the result: {dump}"
+    );
+    // Nothing of the tool output is left behind in the later message.
+    let later = &formatted[4];
+    assert_eq!(later.role, "user");
+    assert!(
+        matches!(&later.content[..], [ApiContentBlock::Text { text, .. }] if text == "unrelated note"),
+        "later message must keep only its unrelated text: {dump}"
+    );
+    assert!(formatted.windows(2).all(|w| w[0].role != w[1].role));
+}
+
+fn oauth_account(
+    label: &str,
+    access: &str,
+    refresh: &str,
+) -> jcode_base::auth::claude::AnthropicAccount {
+    jcode_base::auth::claude::AnthropicAccount {
+        label: label.to_string(),
+        access: access.to_string(),
+        refresh: refresh.to_string(),
+        expires: chrono::Utc::now().timestamp_millis() + 8 * 60 * 60 * 1000,
+        email: None,
+        subscription_type: Some("max".to_string()),
+        scopes: vec!["user:inference".to_string()],
+    }
+}
+
+/// A same-label relogin (`jcode login --provider claude` reusing the current
+/// label for a different Claude account) must reach every live session,
+/// including forks that already cached the previous account's token.
+#[tokio::test]
+async fn same_label_relogin_replaces_cached_token_in_every_live_session() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    let _runtime = EnvVarGuard::set("JCODE_RUNTIME_PROVIDER", "claude");
+    jcode_base::auth::claude::set_active_account_override(None);
+
+    let label = jcode_base::auth::claude::upsert_account(oauth_account(
+        "claude-1",
+        "old-account-access",
+        "old-account-refresh",
+    ))
+    .unwrap();
+
+    let provider = AnthropicProvider::new();
+    // Each fork owns an independent credential cache, like a second session.
+    let fork = &AnthropicProvider::new();
+    assert_eq!(
+        provider.get_access_token().await.unwrap().0,
+        "old-account-access"
+    );
+    assert_eq!(
+        fork.get_access_token().await.unwrap().0,
+        "old-account-access"
+    );
+
+    // Relogin stores a different account under the same label. The login
+    // flow invalidates auth state the same way the CLI/TUI notify path does.
+    jcode_base::auth::claude::upsert_account(oauth_account(
+        &label,
+        "new-account-access-token",
+        "new-account-refresh-token",
+    ))
+    .unwrap();
+    jcode_base::auth::AuthStatus::invalidate_cache();
+
+    assert_eq!(
+        provider.get_access_token().await.unwrap().0,
+        "new-account-access-token",
+        "the originating session must not keep the old account's cached token"
+    );
+    assert_eq!(
+        fork.get_access_token().await.unwrap().0,
+        "new-account-access-token",
+        "other live sessions must not keep the old account's cached token"
+    );
+}
+
+/// `/account switch` only reaches the requesting session's provider. Every
+/// other live session must still pick up the newly active account on its next
+/// request instead of reusing its cached token for hours.
+#[tokio::test]
+async fn account_switch_replaces_cached_token_in_other_live_sessions() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    let _runtime = EnvVarGuard::set("JCODE_RUNTIME_PROVIDER", "claude");
+    jcode_base::auth::claude::set_active_account_override(None);
+
+    let first = jcode_base::auth::claude::upsert_account(oauth_account(
+        "claude-1",
+        "first-account-access",
+        "first-account-refresh",
+    ))
+    .unwrap();
+    let second = jcode_base::auth::claude::upsert_account(oauth_account(
+        "claude-2",
+        "second-account-access",
+        "second-account-refresh",
+    ))
+    .unwrap();
+    jcode_base::auth::claude::set_active_account(&first).unwrap();
+
+    let other_session = AnthropicProvider::new();
+    assert_eq!(
+        other_session.get_access_token().await.unwrap().0,
+        "first-account-access"
+    );
+
+    jcode_base::auth::claude::set_active_account(&second).unwrap();
+
+    assert_eq!(
+        other_session.get_access_token().await.unwrap().0,
+        "second-account-access"
+    );
+    jcode_base::auth::claude::set_active_account_override(None);
+}
+
+/// An external Claude Code relogin rewrites its credentials file without
+/// notifying jcode. The next request must still use the new login.
+#[tokio::test]
+async fn external_claude_code_relogin_replaces_cached_token() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    let _runtime = EnvVarGuard::set("JCODE_RUNTIME_PROVIDER", "claude");
+    jcode_base::auth::claude::set_active_account_override(None);
+
+    let path = temp.path().join("external/.claude/.credentials.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let write_login = |access: &str| {
+        let expires = chrono::Utc::now().timestamp_millis() + 8 * 60 * 60 * 1000;
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": access,
+                    "refreshToken": format!("{access}-refresh"),
+                    "expiresAt": expires,
+                    "scopes": ["user:inference"],
+                    "subscriptionType": "max"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    };
+    write_login("claude-code-old-login");
+    jcode_base::auth::claude::trust_external_auth_source(
+        jcode_base::auth::claude::ExternalClaudeAuthSource::ClaudeCode,
+    )
+    .unwrap();
+
+    let provider = AnthropicProvider::new();
+    assert_eq!(
+        provider.get_access_token().await.unwrap().0,
+        "claude-code-old-login"
+    );
+
+    write_login("claude-code-new-login-other-account");
+
+    assert_eq!(
+        provider.get_access_token().await.unwrap().0,
+        "claude-code-new-login-other-account"
+    );
+}
+
+/// Tiny fake of the OAuth Messages endpoint. A bearer containing `LIMITED`
+/// gets a subscription usage-limit 429 (`retry-after: 60`, unified reset
+/// hours away); any other bearer gets a short streamed reply. Records each
+/// request's bearer token.
+async fn spawn_fake_messages_api(
+    reset_in_secs: u64,
+) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_task = Arc::clone(&seen);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let seen = Arc::clone(&seen_task);
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                // Read headers, then the declared body.
+                let (head_end, content_length) = loop {
+                    let n = socket.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        break (pos + 4, len);
+                    }
+                };
+                while buf.len() < head_end + content_length {
+                    let n = socket.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                let token = head
+                    .lines()
+                    .find_map(|l| {
+                        let lower = l.to_ascii_lowercase();
+                        lower
+                            .starts_with("authorization:")
+                            .then(|| l["authorization:".len()..].trim().to_string())
+                    })
+                    .unwrap_or_default()
+                    .trim_start_matches("Bearer ")
+                    .to_string();
+                let limited = token.contains("LIMITED");
+                seen.lock().unwrap().push(token);
+                let response = if limited {
+                    let reset = chrono::Utc::now().timestamp() as u64 + reset_in_secs;
+                    let body = r#"{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."}}"#;
+                    format!(
+                        "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\nretry-after: {reset_in_secs}\r\nanthropic-ratelimit-unified-status: rejected\r\nanthropic-ratelimit-unified-reset: {reset}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else {
+                    let body = concat!(
+                        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+                        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi from B\"}}\n\n",
+                        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+                        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                    );
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    (format!("http://{addr}/v1/messages?beta=true"), seen)
+}
+
+struct OAuthUrlOverride;
+
+impl OAuthUrlOverride {
+    fn set(url: &str) -> Self {
+        *OAUTH_API_URL_OVERRIDE.lock().unwrap() = Some(url.to_string());
+        Self
+    }
+}
+
+impl Drop for OAuthUrlOverride {
+    fn drop(&mut self) {
+        *OAUTH_API_URL_OVERRIDE.lock().unwrap() = None;
+    }
+}
+
+fn minimal_oauth_request() -> ApiRequest {
+    ApiRequest {
+        model: "claude-opus-4-8".to_string(),
+        max_tokens: 64,
+        system: None,
+        messages: Vec::new(),
+        tools: None,
+        metadata: None,
+        thinking: None,
+        output_config: None,
+        temperature: None,
+        service_tier: None,
+        stream: true,
+    }
+}
+
+/// Start `run_stream_with_retries` exactly as `complete()` does, on the
+/// token currently stored.
+async fn start_oauth_stream(provider: &AnthropicProvider) -> mpsc::Receiver<Result<StreamEvent>> {
+    let (token, is_oauth) = provider.get_access_token().await.unwrap();
+    assert!(is_oauth);
+    let (tx, rx) = mpsc::channel(100);
+    tokio::spawn(run_stream_with_retries(
+        provider.client.clone(),
+        token,
+        true,
+        minimal_oauth_request(),
+        tx,
+        Arc::clone(&provider.credentials),
+        provider.account_pin.clone(),
+        "claude-opus-4-8".to_string(),
+        provider.oauth_session_id.clone(),
+        Arc::clone(&provider.model),
+        provider.direct_transport.clone(),
+        reasoning_request::RetrySettings::from_provider(provider),
+    ));
+    rx
+}
+
+/// Drain the stream until it ends. Returns (text, first error).
+async fn drain_stream(rx: &mut mpsc::Receiver<Result<StreamEvent>>) -> (String, Option<String>) {
+    let mut text = String::new();
+    while let Some(event) = rx.recv().await {
+        match event {
+            Ok(StreamEvent::TextDelta(delta)) => text.push_str(&delta),
+            Ok(_) => {}
+            Err(error) => return (text, Some(format!("{error:#}"))),
+        }
+    }
+    (text, None)
+}
+
+/// A turn held on account A's usage limit is sleeping out the 60 s
+/// Retry-After cap when the user swaps to account B. The retry must wake as
+/// soon as the credential changes and finish on B, not after the full sleep.
+#[tokio::test]
+async fn held_retry_wakes_on_credential_swap_and_finishes_on_new_account() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    let _runtime = EnvVarGuard::set("JCODE_RUNTIME_PROVIDER", "claude");
+    jcode_base::auth::claude::set_active_account_override(None);
+    let (url, seen) = spawn_fake_messages_api(60).await;
+    let _url = OAuthUrlOverride::set(&url);
+
+    let label = jcode_base::auth::claude::upsert_account(oauth_account(
+        "claude-1",
+        "token-A-LIMITED",
+        "refresh-A",
+    ))
+    .unwrap();
+    let provider = AnthropicProvider::new();
+    let mut rx = start_oauth_stream(&provider).await;
+
+    // Let the first attempt hit the 429 and enter the retry sleep.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while seen.lock().unwrap().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "no first request");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Same-label relogin to account B, announced like every auth path does.
+    let swapped_at = std::time::Instant::now();
+    jcode_base::auth::claude::upsert_account(oauth_account(&label, "token-B-HEALTHY", "refresh-B"))
+        .unwrap();
+    jcode_base::auth::AuthStatus::invalidate_cache();
+
+    let (text, error) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), drain_stream(&mut rx))
+            .await
+            .expect("held retry must not sleep out the 60 s Retry-After after a swap");
+    assert_eq!(error, None);
+    assert_eq!(text, "hi from B");
+    assert!(swapped_at.elapsed() < std::time::Duration::from_secs(5));
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen, vec!["token-A-LIMITED", "token-B-HEALTHY"]);
+}
+
+/// A subscription usage limit that resets hours from now is doomed on this
+/// account. Without a credential change, fail fast with the reset time (so
+/// the client can hold the turn and resend on a swap) instead of burning two
+/// minutes of capped Retry-After sleeps against the same token.
+#[tokio::test]
+async fn far_usage_limit_reset_fails_fast_with_reset_time() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    let _runtime = EnvVarGuard::set("JCODE_RUNTIME_PROVIDER", "claude");
+    jcode_base::auth::claude::set_active_account_override(None);
+    let reset_in = 3 * 3600 + 17 * 60;
+    let (url, seen) = spawn_fake_messages_api(reset_in).await;
+    let _url = OAuthUrlOverride::set(&url);
+
+    jcode_base::auth::claude::upsert_account(oauth_account(
+        "claude-1",
+        "token-A-LIMITED",
+        "refresh-A",
+    ))
+    .unwrap();
+    let provider = AnthropicProvider::new();
+    let started = std::time::Instant::now();
+    let mut rx = start_oauth_stream(&provider).await;
+
+    let (_, error) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), drain_stream(&mut rx))
+            .await
+            .expect("a usage limit resetting hours away must fail fast");
+    let error = error.expect("usage limit must surface as an error");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "no doomed retries on the same token"
+    );
+    assert!(error.contains("429"), "{error}");
+    // The TUI hold logic parses "resets in 3h 17m" (unit-suffixed, < 1 day).
+    let lower = error.to_lowercase();
+    assert!(
+        lower.contains("resets in 3h 1"),
+        "reset time missing: {error}"
+    );
+}
+
+#[test]
+fn short_429_keeps_retry_after_and_far_usage_limit_is_terminal() {
+    let now = chrono::Utc::now().timestamp();
+    let mut headers = HeaderMap::new();
+    headers.insert("retry-after", HeaderValue::from_static("7"));
+    let short = anthropic_status_error(
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        &headers,
+        "rate_limit_error",
+    );
+    assert!(short.downcast_ref::<UsageLimitExhausted>().is_none());
+    assert_eq!(
+        jcode_provider_core::retry_after::retry_after_from_error(&short).map(|d| d.as_secs() <= 7),
+        Some(true),
+        "ordinary 429 keeps its Retry-After hint"
+    );
+
+    // Unified limit that resets within the retry window stays retryable.
+    headers.insert(
+        "anthropic-ratelimit-unified-status",
+        HeaderValue::from_static("rejected"),
+    );
+    headers.insert(
+        "anthropic-ratelimit-unified-reset",
+        HeaderValue::from_str(&(now + 30).to_string()).unwrap(),
+    );
+    let near = anthropic_status_error(
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        &headers,
+        "rate_limit_error",
+    );
+    assert!(near.downcast_ref::<UsageLimitExhausted>().is_none());
+
+    headers.insert(
+        "anthropic-ratelimit-unified-reset",
+        HeaderValue::from_str(&(now + 5 * 3600 + 60).to_string()).unwrap(),
+    );
+    let far = anthropic_status_error(
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        &headers,
+        "rate_limit_error",
+    );
+    assert!(far.downcast_ref::<UsageLimitExhausted>().is_some());
+    assert!(far.to_string().contains("resets in 5h"), "{far}");
+
+    // Account failover detects exhaustion through the stable marker only.
+    let far_limit = jcode_provider_core::classify_account_usage_limit(&format!("{far:#}"))
+        .expect("far usage limit must carry the account-usage-limit marker");
+    let resets_at = far_limit.resets_at.expect("marker carries resets_at");
+    assert!((resets_at - (now + 5 * 3600 + 60)).abs() <= 2, "{far}");
+    assert_eq!(
+        jcode_provider_core::classify_account_usage_limit(&format!("{near:#}")),
+        None,
+        "a reset within 120 s is a short 429, not exhaustion"
+    );
+    assert_eq!(
+        jcode_provider_core::classify_account_usage_limit(&format!("{short:#}")),
+        None,
+        "a plain retry-after 429 is not exhaustion"
+    );
+
+    // No unified headers, but the body names a usage limit.
+    let body_only = anthropic_status_error(
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        &HeaderMap::new(),
+        "You have reached your usage limit",
+    );
+    assert!(body_only.downcast_ref::<UsageLimitExhausted>().is_some());
+    assert_eq!(
+        jcode_provider_core::classify_account_usage_limit(&format!("{body_only:#}")),
+        Some(jcode_provider_core::AccountUsageLimit { resets_at: None })
+    );
+
+    // Other statuses are untouched.
+    let server = anthropic_status_error(
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        &headers,
+        "overloaded",
+    );
+    assert!(server.downcast_ref::<UsageLimitExhausted>().is_none());
+}
+
+#[test]
+fn reset_duration_format_is_compact() {
+    assert_eq!(format_reset_duration(30), "1m");
+    assert_eq!(format_reset_duration(3 * 3600 + 17 * 60), "3h 17m");
+    assert_eq!(format_reset_duration(2 * 86_400 + 3600), "2d 1h 0m");
+}
+
+fn refreshed_claude_tokens(access: &str, refresh: &str) -> jcode_base::auth::oauth::OAuthTokens {
+    jcode_base::auth::oauth::OAuthTokens {
+        access_token: access.to_string(),
+        refresh_token: refresh.to_string(),
+        expires_at: chrono::Utc::now().timestamp_millis() + 3_600_000,
+        id_token: None,
+        scopes: vec!["user:inference".to_string()],
+    }
+}
+
+/// A token refresh that started for one Claude account and finishes after an
+/// account switch must not cache or return the old account's bearer.
+#[tokio::test]
+async fn claude_refresh_finishing_after_account_switch_keeps_new_login() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    let _runtime = EnvVarGuard::set("JCODE_RUNTIME_PROVIDER", "claude");
+    jcode_base::auth::claude::set_active_account_override(None);
+
+    let first = jcode_base::auth::claude::upsert_account(oauth_account(
+        "claude-1",
+        "first-account-access",
+        "first-account-refresh",
+    ))
+    .unwrap();
+    let second = jcode_base::auth::claude::upsert_account(oauth_account(
+        "claude-2",
+        "second-account-access",
+        "second-account-refresh",
+    ))
+    .unwrap();
+    jcode_base::auth::claude::set_active_account(&first).unwrap();
+    let source = (
+        "first-account-access".to_string(),
+        "first-account-refresh".to_string(),
+    );
+    let credentials = Arc::new(RwLock::new(None));
+
+    // The refresh for the first account is in flight when the user switches.
+    jcode_base::auth::claude::set_active_account(&second).unwrap();
+    let bearer = commit_claude_refresh(
+        &credentials,
+        &AccountPinSlot::default(),
+        source,
+        refreshed_claude_tokens("first-account-refreshed", "first-account-rotated"),
+    )
+    .await;
+
+    assert_eq!(bearer, "second-account-access");
+    assert!(
+        credentials
+            .read()
+            .await
+            .as_ref()
+            .is_none_or(|cached| cached.access_token != "first-account-refreshed"),
+        "the old account's refreshed token must not be cached for the new login"
+    );
+    jcode_base::auth::claude::set_active_account_override(None);
+}
+
+/// Without an account change the refreshed token is cached and returned, both
+/// for a stored account (whose refresh is persisted) and an external source
+/// (whose stored credential is not rewritten).
+#[tokio::test]
+async fn claude_refresh_without_account_switch_updates_cache() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    let _runtime = EnvVarGuard::set("JCODE_RUNTIME_PROVIDER", "claude");
+    jcode_base::auth::claude::set_active_account_override(None);
+
+    let label = jcode_base::auth::claude::upsert_account(oauth_account(
+        "claude-1",
+        "account-access",
+        "account-refresh",
+    ))
+    .unwrap();
+    let source = ("account-access".to_string(), "account-refresh".to_string());
+    let credentials = Arc::new(RwLock::new(None));
+
+    // External-style: the store still holds the source credential.
+    let bearer = commit_claude_refresh(
+        &credentials,
+        &AccountPinSlot::default(),
+        source.clone(),
+        refreshed_claude_tokens("account-refreshed-1", "account-rotated-1"),
+    )
+    .await;
+    assert_eq!(bearer, "account-refreshed-1");
+
+    // Stored-account style: the refresh was persisted under the same label.
+    jcode_base::auth::claude::upsert_account(oauth_account(
+        &label,
+        "account-refreshed-2",
+        "account-rotated-2",
+    ))
+    .unwrap();
+    let bearer = commit_claude_refresh(
+        &credentials,
+        &AccountPinSlot::default(),
+        source,
+        refreshed_claude_tokens("account-refreshed-2", "account-rotated-2"),
+    )
+    .await;
+    assert_eq!(bearer, "account-refreshed-2");
+    assert_eq!(
+        credentials.read().await.as_ref().unwrap().access_token,
+        "account-refreshed-2"
+    );
+    jcode_base::auth::claude::set_active_account_override(None);
+}
+
+fn seed_two_pinnable_claude_accounts() -> (AccountPin, AccountPin) {
+    let mut otter = oauth_account("claude-1", "token-otter", "refresh-otter");
+    otter.email = Some("otter@example.com".to_string());
+    let mut fox = oauth_account("claude-2", "token-fox", "refresh-fox");
+    fox.email = Some("fox@example.com".to_string());
+    let otter_label = jcode_base::auth::claude::upsert_account(otter).unwrap();
+    let fox_label = jcode_base::auth::claude::upsert_account(fox).unwrap();
+    jcode_base::auth::claude::set_active_account(&otter_label).unwrap();
+    jcode_base::auth::claude::set_active_account_override(None);
+    (
+        jcode_base::auth::claude::pin_for_label(&otter_label).unwrap(),
+        jcode_base::auth::claude::pin_for_label(&fox_label).unwrap(),
+    )
+}
+
+/// Two sessions (forks) pinned to different accounts send different bearers
+/// at the same time, and neither changes the stored default.
+#[tokio::test]
+async fn two_anthropic_forks_with_different_pins_send_different_bearers() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    let _runtime = EnvVarGuard::set("JCODE_RUNTIME_PROVIDER", "claude");
+    jcode_base::auth::claude::set_active_account_override(None);
+    let (url, seen) = spawn_fake_messages_api(60).await;
+    let _url = OAuthUrlOverride::set(&url);
+    let (_otter, fox) = seed_two_pinnable_claude_accounts();
+
+    let window_a = AnthropicProvider::new();
+    let window_b = window_a.fork_concrete();
+    window_b
+        .set_account_pin(AccountProviderKind::Claude, Some(fox.clone()))
+        .unwrap();
+
+    let mut rx_a = start_oauth_stream(&window_a).await;
+    let mut rx_b = start_oauth_stream(&window_b).await;
+    let (a, b) = tokio::join!(drain_stream(&mut rx_a), drain_stream(&mut rx_b));
+    assert_eq!(a.1, None);
+    assert_eq!(b.1, None);
+
+    let mut seen = seen.lock().unwrap().clone();
+    seen.sort();
+    assert_eq!(seen, vec!["token-fox", "token-otter"]);
+    assert_eq!(
+        window_b
+            .resolved_account_label(AccountProviderKind::Claude)
+            .as_deref(),
+        Some("claude-fox")
+    );
+    assert_eq!(
+        window_a
+            .resolved_account_label(AccountProviderKind::Claude)
+            .as_deref(),
+        Some("claude-otter")
+    );
+    assert_eq!(
+        jcode_base::auth::claude::default_account_label().as_deref(),
+        Some("claude-otter"),
+        "pinning one window must not change the default"
+    );
+    // A fork copies the pin value but not the slot.
+    let fork_of_b = window_b.fork_concrete();
+    assert_eq!(
+        fork_of_b.account_pin(AccountProviderKind::Claude),
+        Some(fox)
+    );
+    fork_of_b
+        .set_account_pin(AccountProviderKind::Claude, None)
+        .unwrap();
+    assert!(window_b.account_pin(AccountProviderKind::Claude).is_some());
+}
+
+/// A turn held on otter's usage limit is waiting to retry when this window is
+/// pinned to fox. The retry must wake and finish on fox.
+#[tokio::test]
+async fn anthropic_retry_after_pin_change_uses_new_account() {
+    let _guard = jcode_base::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+    let _runtime = EnvVarGuard::set("JCODE_RUNTIME_PROVIDER", "claude");
+    jcode_base::auth::claude::set_active_account_override(None);
+    let (url, seen) = spawn_fake_messages_api(60).await;
+    let _url = OAuthUrlOverride::set(&url);
+
+    let mut otter = oauth_account("claude-1", "token-otter-LIMITED", "refresh-otter");
+    otter.email = Some("otter@example.com".to_string());
+    let mut fox = oauth_account("claude-2", "token-fox-HEALTHY", "refresh-fox");
+    fox.email = Some("fox@example.com".to_string());
+    let otter_label = jcode_base::auth::claude::upsert_account(otter).unwrap();
+    let fox_label = jcode_base::auth::claude::upsert_account(fox).unwrap();
+    jcode_base::auth::claude::set_active_account(&otter_label).unwrap();
+    jcode_base::auth::claude::set_active_account_override(None);
+    let fox_pin = jcode_base::auth::claude::pin_for_label(&fox_label).unwrap();
+
+    let provider = AnthropicProvider::new();
+    let mut rx = start_oauth_stream(&provider).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while seen.lock().unwrap().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "no first request");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let pinned_at = std::time::Instant::now();
+    provider
+        .set_account_pin(AccountProviderKind::Claude, Some(fox_pin))
+        .unwrap();
+
+    let (text, error) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), drain_stream(&mut rx))
+            .await
+            .expect("the held retry must wake on a pin change");
+    assert_eq!(error, None);
+    assert_eq!(text, "hi from B");
+    assert!(pinned_at.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(
+        seen.lock().unwrap().clone(),
+        vec!["token-otter-LIMITED", "token-fox-HEALTHY"]
+    );
+    assert_eq!(
+        jcode_base::auth::claude::default_account_label().as_deref(),
+        Some("claude-otter")
+    );
 }

@@ -55,7 +55,8 @@ pub(super) use input_dispatch::{
     apply_remote_transcript_event, apply_transcript_event, begin_remote_send,
     begin_remote_split_launch, finish_remote_split_launch, history_matches_pending_startup_prompt,
     route_prepared_input_to_new_remote_session, stage_turn_for_remote_tick_loop,
-    submit_prepared_remote_input, submit_remote_slash_input,
+    submit_prepared_remote_input, submit_remote_slash_input, submit_remote_voice_transcript,
+    submit_voice_transcript,
 };
 pub(super) use key_handling::{
     handle_remote_char_input, handle_remote_key, handle_remote_key_event, send_interleave_now,
@@ -86,8 +87,20 @@ pub(super) enum RemoteEventOutcome {
     Quit,
 }
 
+/// Notice for a turn the user typed that was held after a transient failure
+/// (provider overload) and is now sent again: say plainly that their message
+/// is being resent, instead of the internal "Retrying continuation" wording.
+pub(super) fn held_user_turn_resend_notice(
+    pending: &super::PendingRemoteMessage,
+) -> Option<String> {
+    let resends = u16::from(pending.overload_attempts) + u16::from(pending.retry_attempts);
+    (pending.auto_retry && !pending.is_system && resends > 0)
+        .then(|| format!("✓ Resending your message (attempt {})...", resends + 1))
+}
+
 pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) -> bool {
     app.refresh_terminal_title_metrics();
+    app.sync_herdr_agent_state();
     crate::tui::ui::set_frame_input_attribution(crate::tui::ui::FrameInputAttribution {
         event: Some("tick".to_string()),
         scroll_delta: None,
@@ -97,6 +110,32 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
             .is_some_and(|state| state.kind == crate::tui::PickerKind::Model),
     });
     let mut needs_redraw = crate::tui::periodic_redraw_required(app);
+    needs_redraw |= app.poll_usage_reset();
+    if let Some(account) = app.usage_reset.invalidate_account.take() {
+        match remote.invalidate_openai_usage(account).await {
+            Ok(id) => {
+                app.usage_reset.invalidate_requests.insert(id, Some(Instant::now()));
+            }
+            Err(error) => app.push_display_message(DisplayMessage::error(format!(
+                "Reset result is unchanged, but the daemon usage cache could not be refreshed: {error}. Reconnect to refresh daemon state."
+            ))),
+        }
+        needs_redraw = true;
+    }
+    let mut refresh_timed_out = false;
+    for sent_at in app.usage_reset.invalidate_requests.values_mut() {
+        if sent_at.is_some_and(|sent| sent.elapsed() >= Duration::from_secs(10)) {
+            // Retain the ID so a late control acknowledgement never ends an agent turn.
+            *sent_at = None;
+            refresh_timed_out = true;
+        }
+    }
+    if refresh_timed_out {
+        app.push_display_message(DisplayMessage::system(
+            "Reset result is unchanged, but the daemon usage refresh has not been acknowledged. Reconnect if usage stays stale.".to_string(),
+        ));
+        needs_redraw = true;
+    }
     needs_redraw |= app.poll_ssh_login(remote).await;
     needs_redraw |= app.poll_ssh_login_onboarding();
     needs_redraw |= app.flush_pending_resize_redraw();
@@ -107,7 +146,6 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
     needs_redraw |= app.maybe_push_idle_cold_cache_warning();
     needs_redraw |= app.progress_copy_selection_edge_autoscroll();
     app.progress_mouse_scroll_animation();
-    needs_redraw |= app.update_chat_overscroll();
     needs_redraw |= app.update_pinned_images_auto_hide();
     // Dissolve stale (off-screen) reasoning traces with zero visible motion.
     needs_redraw |= app.gc_offscreen_reasoning_traces();
@@ -115,6 +153,8 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
     // Adopt the resolved scroll position once a frame containing newly loaded
     // older history has rendered, so manual scrolling resumes seamlessly.
     needs_redraw |= app.reconcile_history_anchor();
+    // Same for a resize: adopt the resolved row once the rewrap has rendered.
+    needs_redraw |= app.reconcile_resize_anchor();
     // Reveal buffered streaming text at the smooth paced rate on each tick, the
     // same as the local turn loop. When Done arrived with a backlog, leave one
     // rendered live frame after the final reveal before committing the turn.
@@ -141,6 +181,23 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
     needs_redraw |= app.onboarding_tick();
     needs_redraw |= app.progress_update_simulator();
     needs_redraw |= app.refresh_keybindings_if_config_reloaded();
+    needs_redraw |= app.maybe_progress_provider_failover_countdown();
+    // The countdown stages the switch; send it here (keys are not involved).
+    // The failed turn is resent once the server confirms with ModelChanged.
+    if let Some(spec) = app.pending_model_switch.take() {
+        match remote.set_model(&spec).await {
+            Ok(_) => app.remote_model_switch_in_flight = true,
+            Err(error) => {
+                app.pending_fallback_resend = None;
+                app.push_display_message(DisplayMessage::error(format!(
+                    "Failed to request model switch: {}",
+                    error
+                )));
+                app.set_status_notice("Model switch failed");
+            }
+        }
+        needs_redraw = true;
+    }
 
     let _ = check_debug_command(app, remote).await;
 
@@ -195,6 +252,7 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
         && Instant::now() >= reset_time
     {
         app.rate_limit_reset = None;
+        let account_change_resend = app.account_change_resend_at.take() == Some(reset_time);
         if !app.is_processing
             && let Some(pending) = app.rate_limit_pending_message.clone()
         {
@@ -208,26 +266,33 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
                 app.status = ProcessingStatus::Idle;
                 app.status_detail = None;
             }
-            let status = if pending.auto_retry {
-                format!(
-                    "✓ Retrying continuation...{}",
-                    if pending.is_system {
-                        " (system message)"
-                    } else {
-                        ""
-                    }
-                )
-            } else {
-                format!(
-                    "✓ Rate limit reset. Retrying...{}",
-                    if pending.is_system {
-                        " (system message)"
-                    } else {
-                        ""
-                    }
-                )
-            };
-            app.push_display_message(DisplayMessage::system(status));
+            // An account change already announced this resend; do not also
+            // claim the old account's limit reset.
+            if !account_change_resend {
+                let status = if let Some(notice) = held_user_turn_resend_notice(&pending) {
+                    notice
+                } else if pending.auto_retry {
+                    format!(
+                        "✓ Retrying continuation...{}",
+                        if pending.is_system {
+                            " (system message)"
+                        } else {
+                            ""
+                        }
+                    )
+                } else {
+                    format!(
+                        "✓ Rate limit reset. Retrying...{}",
+                        if pending.is_system {
+                            " (system message)"
+                        } else {
+                            ""
+                        }
+                    )
+                };
+                app.push_display_message(DisplayMessage::system(status));
+            }
+            let overload_attempts = pending.overload_attempts;
             let _ = begin_remote_send(
                 app,
                 remote,
@@ -239,11 +304,19 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
                 pending.retry_attempts,
             )
             .await;
+            // The overload budget belongs to this turn: carry it across the
+            // resend so it stops after OVERLOAD_RETRY_MAX_ATTEMPTS resends.
+            if let Some(resent) = app.rate_limit_pending_message.as_mut() {
+                resent.overload_attempts = overload_attempts;
+            }
             return true;
         }
     }
 
-    if app.pending_queued_dispatch {
+    // Esc redirect hold. On timeout this arms pending_queued_dispatch, which
+    // the next check hands to the normal follow-up path.
+    let holding_for_interrupt = app.awaiting_remote_interrupt_ack();
+    if holding_for_interrupt || app.pending_queued_dispatch {
         return needs_redraw;
     }
 
@@ -329,8 +402,8 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
     needs_redraw
 }
 
-/// Forward the reasoning-effort variant staged by a model-picker selection
-/// (e.g. "gpt-5.5 (high)") to the server right after the model-switch request.
+/// Forward the reasoning level staged by a model-picker selection (e.g.
+/// gpt-5.5 at high) to the server right after the model-switch request.
 /// In remote mode the picker cannot apply effort to `app.provider` (a local
 /// stand-in), so skipping this leaves the server on its configured default
 /// effort - typically low - silently downgrading the request (issue #427).
@@ -416,7 +489,10 @@ async fn apply_terminal_event(
             input_attribution.scroll_delta = key_scroll_delta(&key);
             app.note_client_interaction();
             app.update_copy_badge_key_event(key);
-            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            app.observe_voice_key_release(&key);
+            if app.handle_voice_key_event(&key) {
+                // Voice keys work from every screen and never type.
+            } else if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                 handle_remote_key_event(app, key, remote).await?;
                 if let Some(selection) = app.pending_route_selection.take() {
                     app.pending_model_switch = None;
@@ -453,62 +529,17 @@ async fn apply_terminal_event(
                         }
                     }
                 }
-                if let Some(selection) = app.pending_account_picker_action.take() {
-                    match selection {
-                        crate::tui::AccountPickerAction::Switch { provider_id, label } => {
-                            match provider_id.as_str() {
-                                "claude" => {
-                                    if let Err(e) = crate::auth::claude::set_active_account(&label)
-                                    {
-                                        app.push_display_message(DisplayMessage::error(format!(
-                                            "Failed to switch account: {}",
-                                            e
-                                        )));
-                                    } else {
-                                        crate::auth::AuthStatus::invalidate_cache();
-                                        app.context_limit = app.provider.context_window() as u64;
-                                        app.context_warning_shown = false;
-                                        let _ = remote.switch_anthropic_account(&label).await;
-                                        app.push_display_message(DisplayMessage::system(format!(
-                                            "Switched to Anthropic account `{}`.",
-                                            label
-                                        )));
-                                        app.set_status_notice(format!(
-                                            "Account: switched to {}",
-                                            label
-                                        ));
-                                    }
-                                }
-                                "openai" => {
-                                    if let Err(e) = crate::auth::codex::set_active_account(&label) {
-                                        app.push_display_message(DisplayMessage::error(format!(
-                                            "Failed to switch OpenAI account: {}",
-                                            e
-                                        )));
-                                    } else {
-                                        crate::auth::AuthStatus::invalidate_cache();
-                                        app.context_limit = app.provider.context_window() as u64;
-                                        app.context_warning_shown = false;
-                                        let _ = remote.switch_openai_account(&label).await;
-                                        app.push_display_message(DisplayMessage::system(format!(
-                                            "Switched to OpenAI account `{}`.",
-                                            label
-                                        )));
-                                        app.set_status_notice(format!(
-                                            "OpenAI account: switched to {}",
-                                            label
-                                        ));
-                                    }
-                                }
-                                _ => app.push_display_message(DisplayMessage::error(format!(
-                                    "Provider `{}` does not support account switching.",
-                                    provider_id
-                                ))),
-                            }
-                        }
-                        crate::tui::AccountPickerAction::Add { .. }
-                        | crate::tui::AccountPickerAction::Replace { .. }
-                        | crate::tui::AccountPickerAction::OpenCenter { .. } => {}
+                if let Some(selection) = app.pending_account_picker_action.take()
+                    && let Some(command) =
+                        crate::tui::app::auth::account_command_from_inline_action(&selection)
+                {
+                    if let Err(error) = app
+                        .execute_window_account_command_remote(command, remote)
+                        .await
+                    {
+                        app.push_display_message(DisplayMessage::error(format!(
+                            "Failed to update this window's account: {error}"
+                        )));
                     }
                 }
             }
@@ -675,6 +706,20 @@ pub(super) async fn handle_bus_event(
             app.handle_dictation_failure(message);
             true
         }
+        Ok(BusEvent::VoiceInputWake) => match app.poll_voice_input() {
+            super::voice_input::VoicePoll::Idle => false,
+            super::voice_input::VoicePoll::Changed => true,
+            super::voice_input::VoicePoll::Transcript(text) => {
+                if let Err(error) = submit_remote_voice_transcript(app, remote, &text).await {
+                    app.push_display_message(DisplayMessage::error(format!(
+                        "Failed to send voice transcript: {error}"
+                    )));
+                    app.set_status_notice("Voice transcript not sent");
+                }
+                process_remote_followups(app, remote).await;
+                true
+            }
+        },
         _ => false,
     }
 }
@@ -790,7 +835,10 @@ fn handle_terminal_event_while_disconnected(
         Some(Ok(Event::Key(key))) => {
             app.note_client_interaction();
             app.update_copy_badge_key_event(key);
-            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            app.observe_voice_key_release(&key);
+            if app.handle_voice_key_event(&key) {
+                // Voice keys work from every screen and never type.
+            } else if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                 handle_disconnected_key_event(app, key)?;
             }
             needs_redraw = true;
@@ -1269,6 +1317,12 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
 
     if !remote.has_loaded_history() {
         note_startup_submit_deferred(app, "remote history not loaded yet");
+        return;
+    }
+
+    // Esc redirected to a pending prompt: the server sends Done before
+    // Interrupted. Sending now would let the late Interrupted end the new turn.
+    if app.awaiting_remote_interrupt_ack() {
         return;
     }
 
@@ -1932,8 +1986,11 @@ fn handle_disconnected_key_internal(
 
     if modifiers.contains(KeyModifiers::CONTROL) {
         match code {
+            KeyCode::Char('d') if input::try_ctrl_d_forward_delete(app) => {
+                return Ok(());
+            }
             KeyCode::Char('c') | KeyCode::Char('d') => {
-                app.handle_quit_request();
+                input::clear_draft_or_request_quit(app);
                 return Ok(());
             }
             KeyCode::Char('l') if !app.diff_pane_visible() => {

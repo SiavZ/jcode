@@ -5,11 +5,13 @@ mod auth_account_picker;
 #[path = "auth_types.rs"]
 mod auth_types;
 pub(crate) use self::auth_account_commands::{
-    account_command_from_picker, execute_account_command_local, execute_account_command_remote,
-    handle_account_command_remote, handle_auth_command, resolve_account_provider_descriptor,
-    save_openai_fast_setting_local,
+    account_command_from_inline_action, account_command_from_picker, execute_account_command_local,
+    execute_account_command_remote, handle_account_command_remote, handle_auth_command,
+    resolve_account_provider_descriptor, same_account_command, save_openai_fast_setting_local,
 };
-pub(super) use self::auth_types::{AccountCommand, PendingAccountInput, PendingLogin};
+pub(super) use self::auth_types::{
+    AccountCommand, AccountFailoverMode, PendingAccountInput, PendingLogin,
+};
 
 use super::*;
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -590,9 +592,78 @@ impl App {
     }
 
     fn start_claude_login(&mut self) {
+        let prompt = if crate::auth::claude::prefer_claude_code_cli_login() {
+            "Claude login method\n\n1. Jcode OAuth: sign in directly in a browser.\n2. Claude Code CLI (default): sign in with `claude auth login` in a new terminal, then approve Jcode's access to that login.\n\nReply 1 or 2 (Enter for 2), or /cancel."
+        } else {
+            "Claude login method\n\n1. Jcode OAuth (default): sign in directly in a browser.\n2. Claude Code CLI: sign in with `claude auth login` in a new terminal, then approve Jcode's access to that login.\n\nReply 1 or 2 (Enter for 1), or /cancel."
+        };
+        self.push_display_message(DisplayMessage::system(prompt.to_string()));
+        self.set_status_notice("Claude login: choose 1 or 2");
+        self.begin_pending_login(PendingLogin::ClaudeMethodChoice);
+    }
+
+    fn start_jcode_claude_login(&mut self) {
         let label = crate::auth::claude::login_target_label(None)
             .unwrap_or_else(|_| crate::auth::claude::primary_account_label());
         self.start_claude_login_for_account(&label);
+    }
+
+    fn start_claude_code_cli_login(&mut self) {
+        if crate::tui::is_ssh_remote() {
+            self.push_display_message(DisplayMessage::error(
+                "Claude Code CLI login must run on the remote host. SSH into that host and run `jcode login --provider claude --claude-code` there."
+                    .to_string(),
+            ));
+            return;
+        }
+        let command = "jcode login --provider claude --claude-code";
+        // macOS terminal launchers start a fresh login shell rather than
+        // inheriting this process's environment. Do not silently sign into a
+        // different Claude profile or Jcode home.
+        if ["CLAUDE_CONFIG_DIR", "JCODE_HOME"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+        {
+            self.push_display_message(DisplayMessage::system(format!(
+                "This Jcode session uses CLAUDE_CONFIG_DIR or JCODE_HOME. Open a terminal with the same environment settings, then run:\n\n  {command}\n\nA new terminal here may lose those settings and sign into the wrong profile."
+            )));
+            self.set_status_notice(
+                "Claude Code CLI login: run on Jcode host with same environment",
+            );
+            return;
+        }
+        let opened = if cfg!(test) {
+            Ok(false)
+        } else {
+            std::env::current_exe().and_then(|exe| {
+                let cwd = std::env::current_dir()?;
+                let invocation = crate::terminal_launch::TerminalCommand::new(
+                    exe,
+                    vec![
+                        "login".into(),
+                        "--provider".into(),
+                        "claude".into(),
+                        "--claude-code".into(),
+                    ],
+                )
+                .title("jcode · Claude Code login".to_string());
+                crate::terminal_launch::spawn_command_in_new_terminal(&invocation, &cwd)
+                    .map_err(std::io::Error::other)
+            })
+        };
+        match opened {
+            Ok(true) => self.push_display_message(DisplayMessage::system(
+                "Opened Claude Code login in a new terminal. Complete sign-in and approve credential reuse there; Jcode will refresh its provider status when that command finishes."
+                    .to_string(),
+            )),
+            Ok(false) => self.push_display_message(DisplayMessage::system(format!(
+                "No new terminal was available. Run this on the Jcode host to sign in:\n\n  {command}"
+            ))),
+            Err(error) => self.push_display_message(DisplayMessage::error(format!(
+                "Could not open a terminal ({error}). Run this on the Jcode host:\n\n  {command}"
+            ))),
+        }
+        self.set_status_notice("Claude Code CLI login: complete in terminal");
     }
 
     fn start_jcode_login(&mut self) {
@@ -1006,62 +1077,6 @@ impl App {
         Self::claude_token_exchange(verifier, code, &label, Some(redirect_uri)).await
     }
 
-    pub(super) fn switch_account(&mut self, label: &str) {
-        match crate::auth::claude::set_active_account(label) {
-            Ok(()) => {
-                {
-                    let provider = self.provider.clone();
-                    let label_owned = label.to_string();
-                    tokio::spawn(async move {
-                        provider.invalidate_credentials().await;
-                        crate::logging::info(&format!(
-                            "Switched to Anthropic account '{}'",
-                            label_owned
-                        ));
-                    });
-                }
-                self.push_display_message(DisplayMessage::system(format!(
-                    "Switched to Anthropic account {}.",
-                    label
-                )));
-                // Keep account-sensitive UI state in sync immediately.
-                crate::auth::AuthStatus::invalidate_cache();
-                self.context_limit = self.provider.context_window() as u64;
-                self.context_warning_shown = false;
-            }
-            Err(e) => {
-                self.push_display_message(DisplayMessage::error(format!(
-                    "Failed to switch account: {}",
-                    e
-                )));
-            }
-        }
-    }
-
-    pub(super) fn switch_account_by_label(&mut self, label: &str) {
-        let has_anthropic = crate::auth::claude::list_accounts()
-            .unwrap_or_default()
-            .iter()
-            .any(|account| account.label == label);
-        let has_openai = crate::auth::codex::list_accounts()
-            .unwrap_or_default()
-            .iter()
-            .any(|account| account.label == label);
-
-        match (has_anthropic, has_openai) {
-            (true, false) => self.switch_account(label),
-            (false, true) => self.switch_openai_account(label),
-            (true, true) => self.push_display_message(DisplayMessage::error(format!(
-                "Account label {} exists for both Anthropic and OpenAI. Use /account switch {} or /account openai switch {} explicitly.",
-                label, label, label
-            ))),
-            (false, false) => self.push_display_message(DisplayMessage::error(format!(
-                "No Anthropic or OpenAI account with label {} found.",
-                label
-            ))),
-        }
-    }
-
     pub(super) fn remove_account(&mut self, label: &str) {
         match crate::auth::claude::remove_account(label) {
             Ok(()) => {
@@ -1073,37 +1088,6 @@ impl App {
             Err(e) => {
                 self.push_display_message(DisplayMessage::error(format!(
                     "Failed to remove account: {}",
-                    e
-                )));
-            }
-        }
-    }
-
-    pub(super) fn switch_openai_account(&mut self, label: &str) {
-        match crate::auth::codex::set_active_account(label) {
-            Ok(()) => {
-                {
-                    let provider = self.provider.clone();
-                    let label_owned = label.to_string();
-                    tokio::spawn(async move {
-                        provider.invalidate_credentials().await;
-                        crate::logging::info(&format!(
-                            "Switched to OpenAI account '{}'",
-                            label_owned
-                        ));
-                    });
-                }
-                self.push_display_message(DisplayMessage::system(format!(
-                    "Switched to OpenAI account {}.",
-                    label
-                )));
-                crate::auth::AuthStatus::invalidate_cache();
-                self.context_limit = self.provider.context_window() as u64;
-                self.context_warning_shown = false;
-            }
-            Err(e) => {
-                self.push_display_message(DisplayMessage::error(format!(
-                    "Failed to switch OpenAI account: {}",
                     e
                 )));
             }
@@ -1777,7 +1761,7 @@ impl App {
         self.set_status_notice("Grok Build: preparing sign-in...");
         self.begin_pending_login(PendingLogin::GrokBuild);
         self.push_display_message(DisplayMessage::system(
-            "Grok Build Login\n\nJcode is preparing the managed provider backend. The xAI sign-in URL and device code will appear here. You do not need to install the Grok CLI.\n\nType /cancel to dismiss this login."
+            "Grok Build Login\n\nRequesting an xAI sign-in URL and device code. They will appear here. You do not need to install the Grok CLI.\n\nType /cancel to dismiss this login."
                 .to_string(),
         ));
 
@@ -1821,17 +1805,6 @@ impl App {
 
             match crate::auth::grok_build::complete_device_login(&client, &authorization).await {
                 Ok(()) => {
-                    // The ACP executable is a private provider backend, not an
-                    // authentication dependency. Provision it only after the
-                    // native OAuth flow has completed.
-                    if let Err(error) = crate::auth::grok_build::ensure_cli().await {
-                        Bus::global().publish(BusEvent::LoginCompleted(LoginCompleted {
-                            provider: "grok-build".to_string(),
-                            success: false,
-                            message: format!("Grok Build login succeeded, but its managed runtime could not be prepared: {error:#}"),
-                        }));
-                        return;
-                    }
                     Bus::global().publish(BusEvent::LoginCompleted(LoginCompleted {
                         provider: "grok-build".to_string(),
                         success: true,
@@ -2030,6 +2003,14 @@ impl App {
         }
 
         if trimmed.is_empty() {
+            if matches!(pending, PendingLogin::ClaudeMethodChoice) {
+                if crate::auth::claude::prefer_claude_code_cli_login() {
+                    self.start_claude_code_cli_login();
+                } else {
+                    self.start_jcode_claude_login();
+                }
+                return;
+            }
             let help = match &pending {
                 PendingLogin::AutoImportSelection { .. } => {
                     "Auto import is waiting for your selection. Reply with a to approve all, 1,3 to approve specific sources, or /cancel to abort.".to_string()
@@ -2064,6 +2045,17 @@ impl App {
                 // SSH input must never fall through to laptop credential handlers.
                 self.append_ssh_login_input(&input);
             }
+            PendingLogin::ClaudeMethodChoice => match trimmed.to_ascii_lowercase().as_str() {
+                "1" | "jcode" | "oauth" => self.start_jcode_claude_login(),
+                "2" | "cli" | "claude-code" => self.start_claude_code_cli_login(),
+                _ => {
+                    self.push_display_message(DisplayMessage::system(
+                        "Choose 1 for Jcode OAuth or 2 for Claude Code CLI, or /cancel."
+                            .to_string(),
+                    ));
+                    self.pending_login = Some(PendingLogin::ClaudeMethodChoice);
+                }
+            },
             PendingLogin::ClaudeAccount {
                 verifier,
                 label,

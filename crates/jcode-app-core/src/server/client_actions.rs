@@ -11,7 +11,7 @@ use crate::agent::Agent;
 use crate::protocol::{FeatureToggle, NotificationType, ServerEvent};
 use crate::session::Session;
 use crate::util::truncate_str;
-use jcode_agent_runtime::{SoftInterruptSource, StreamError};
+use jcode_agent_runtime::SoftInterruptSource;
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -170,7 +170,70 @@ pub(super) async fn handle_notify_session(
             id,
             message: format!("Session '{}' is not currently live", session_id),
             retry_after_secs: None,
+            server_resumes: false,
         });
+    }
+}
+
+/// A user pressed something in an agent applet: store its state, publish, then
+/// resolve a waiting `applet` tool call or wake the agent like a notification.
+pub(super) async fn handle_applet_action(
+    id: u64,
+    session_id: String,
+    instance: String,
+    action: jcode_applet_types::Action,
+    state: serde_json::Value,
+    source_key: Option<String>,
+    ctx: NotifySessionContext<'_>,
+) {
+    let stored = match crate::applets::set_state(&session_id, &instance, state) {
+        Ok(stored) => stored,
+        Err(error) => {
+            let _ = ctx.client_event_tx.send(ServerEvent::Error {
+                id,
+                message: error.to_string(),
+                retry_after_secs: None,
+                server_resumes: false,
+            });
+            return;
+        }
+    };
+    let (snapshot, inst) = stored;
+    crate::tool::applet::publish(&session_id, snapshot);
+    let message = crate::tool::applet::format_action_message(
+        &instance,
+        &inst.document.title,
+        &action,
+        &inst.document.state,
+        source_key.as_deref(),
+    );
+    if crate::tool::applet::deliver_to_waiter(&session_id, &instance, message.clone()) {
+        let _ = ctx.client_event_tx.send(ServerEvent::Done { id });
+        return;
+    }
+    handle_notify_session(id, session_id, message, ctx).await;
+}
+
+/// The user closed an agent applet. No agent wake.
+pub(super) fn handle_close_applet(
+    id: u64,
+    session_id: String,
+    instance: String,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    match crate::applets::close(&session_id, &instance) {
+        Ok((snapshot, _)) => {
+            crate::tool::applet::publish(&session_id, snapshot);
+            let _ = client_event_tx.send(ServerEvent::Done { id });
+        }
+        Err(error) => {
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message: error.to_string(),
+                retry_after_secs: None,
+                server_resumes: false,
+            });
+        }
     }
 }
 
@@ -228,6 +291,23 @@ pub(super) fn handle_input_shell(
     });
 }
 
+/// Routing for future workers is metadata, so it can be updated during a turn.
+pub(super) async fn set_session_agent_model(
+    agent: &Arc<Mutex<Agent>>,
+    session_id: &str,
+    target: &str,
+    model: Option<String>,
+) -> anyhow::Result<crate::session::AgentModelOverrides> {
+    if let Ok(mut guard) = agent.try_lock() {
+        guard.set_agent_model_override(target, model)?;
+        Ok(guard.session_for_split().agent_model_overrides.clone())
+    } else {
+        let mut session = Session::load_startup_stub(session_id)?;
+        session.set_agent_model_override(target, model)?;
+        Ok(session.agent_model_overrides)
+    }
+}
+
 pub(super) async fn handle_set_subagent_model(
     id: u64,
     model: Option<String>,
@@ -244,6 +324,7 @@ pub(super) async fn handle_set_subagent_model(
                 id,
                 message: crate::util::format_error_chain(&error),
                 retry_after_secs: None,
+                server_resumes: false,
             });
         }
     }
@@ -287,6 +368,7 @@ pub(super) fn handle_run_subagent(
                         id,
                         message: crate::util::format_error_chain(&error),
                         retry_after_secs: None,
+                        server_resumes: false,
                     });
                     return;
                 }
@@ -298,6 +380,7 @@ pub(super) fn handle_run_subagent(
             name: tool_name.clone(),
         });
         let _ = tx.send(ServerEvent::ToolInput {
+            id: Some(tool_call_id.clone()),
             delta: tool_input.to_string(),
         });
         let _ = tx.send(ServerEvent::ToolExec {
@@ -354,6 +437,7 @@ pub(super) fn handle_run_subagent(
                         id,
                         message: crate::util::format_error_chain(&error),
                         retry_after_secs: None,
+                        server_resumes: false,
                     });
                     return;
                 }
@@ -376,6 +460,7 @@ pub(super) fn handle_run_subagent(
                         id,
                         message: crate::util::format_error_chain(&persist_error),
                         retry_after_secs: None,
+                        server_resumes: false,
                     });
                     return;
                 }
@@ -438,6 +523,7 @@ pub(super) async fn handle_set_feature(
                         id,
                         message: crate::util::format_error_chain(&error),
                         retry_after_secs: None,
+                        server_resumes: false,
                     });
                 }
             }
@@ -453,6 +539,7 @@ pub(super) async fn handle_set_feature(
                         id,
                         message: crate::util::format_error_chain(&error),
                         retry_after_secs: None,
+                        server_resumes: false,
                     });
                 }
             }
@@ -542,6 +629,76 @@ pub(super) async fn handle_set_feature(
     }
 }
 
+/// Bookmark or unbookmark the session. A save label is the name the user chose,
+/// so it doubles as the session title and is announced like a rename.
+pub(super) async fn handle_set_session_saved(
+    id: u64,
+    saved: bool,
+    label: Option<String>,
+    agent: &Arc<Mutex<Agent>>,
+    client_session_id: &str,
+    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    let result = agent.lock().await.set_session_saved(saved, label.clone());
+    if let Err(error) = result {
+        let _ = client_event_tx.send(ServerEvent::Error {
+            id,
+            message: crate::util::format_error_chain(&error),
+            retry_after_secs: None,
+            server_resumes: false,
+        });
+        return;
+    }
+    crate::session_list_cache::invalidate();
+    let label = label
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty());
+    if saved && label.is_some() {
+        let (session_id, display_title) = {
+            let agent = agent.lock().await;
+            (
+                agent.session_id().to_string(),
+                agent.session_display_title_or_name(),
+            )
+        };
+        broadcast_session_renamed(
+            swarm_members,
+            client_session_id,
+            client_event_tx,
+            ServerEvent::SessionRenamed {
+                session_id,
+                title: label.map(ToOwned::to_owned),
+                display_title,
+            },
+        )
+        .await;
+    }
+    let _ = client_event_tx.send(ServerEvent::Done { id });
+}
+
+async fn broadcast_session_renamed(
+    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    client_session_id: &str,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+    event: ServerEvent,
+) -> usize {
+    let ServerEvent::SessionRenamed { session_id, .. } = &event else {
+        return 0;
+    };
+    let renamed_session_id = session_id.clone();
+    let mut delivered =
+        fanout_session_event(swarm_members, &renamed_session_id, event.clone()).await;
+    if renamed_session_id != client_session_id {
+        delivered += fanout_session_event(swarm_members, client_session_id, event.clone()).await;
+    }
+    if delivered == 0 {
+        let _ = client_event_tx.send(event);
+    }
+    delivered
+}
+
 pub(super) async fn handle_rename_session(
     id: u64,
     title: Option<String>,
@@ -591,6 +748,7 @@ pub(super) async fn handle_rename_session(
                     id,
                     message: crate::util::format_error_chain(&error),
                     retry_after_secs: None,
+                    server_resumes: false,
                 });
                 return;
             }
@@ -603,14 +761,8 @@ pub(super) async fn handle_rename_session(
         title: normalized_title,
         display_title,
     };
-    let mut delivered =
-        fanout_session_event(swarm_members, &renamed_session_id, event.clone()).await;
-    if renamed_session_id != client_session_id {
-        delivered += fanout_session_event(swarm_members, client_session_id, event.clone()).await;
-    }
-    if delivered == 0 {
-        let _ = client_event_tx.send(event);
-    }
+    let delivered =
+        broadcast_session_renamed(swarm_members, client_session_id, client_event_tx, event).await;
     let _ = client_event_tx.send(ServerEvent::Done { id });
     crate::logging::event_info(
         "SESSION_LIFECYCLE",
@@ -676,8 +828,10 @@ fn clone_split_session(
     let mut child = Session::create(Some(parent_session_id.to_string()), None);
     child.replace_messages(parent.messages.clone());
     child.compaction = parent.compaction.clone();
+    child.system_prompt = parent.system_prompt.clone();
     child.working_dir = parent.working_dir.clone();
     child.model = parent.model.clone();
+    crate::session_accounts::AccountInheritance::from_session(&parent).apply_to_session(&mut child);
     child.status = crate::session::SessionStatus::Closed;
     // The parent agent keeps ownership of any in-flight request; tell the
     // forked agent so it treats the next prompt as fresh work instead of
@@ -710,10 +864,12 @@ fn create_transfer_child_session(
     let mut child = Session::create(Some(parent_session_id.to_string()), None);
     child.messages.clear();
     child.compaction = compaction;
+    child.system_prompt = parent.system_prompt.clone();
     child.working_dir = parent.working_dir.clone();
     child.model = parent.model.clone();
     child.provider_key = parent.provider_key.clone();
     child.route_api_method = parent.route_api_method.clone();
+    crate::session_accounts::AccountInheritance::from_session(parent).apply_to_session(&mut child);
     child.subagent_model = parent.subagent_model.clone();
     child.improve_mode = parent.improve_mode;
     child.autoreview_enabled = parent.autoreview_enabled;
@@ -768,6 +924,7 @@ pub(super) async fn handle_split(
                 id,
                 message: format!("Failed to save split session: {e}"),
                 retry_after_secs: None,
+                server_resumes: false,
             });
             return;
         }
@@ -822,6 +979,7 @@ pub(super) async fn handle_transfer(
                 id,
                 message: format!("Failed to load session for transfer: {error}"),
                 retry_after_secs: None,
+                server_resumes: false,
             });
             return;
         }
@@ -855,6 +1013,7 @@ pub(super) async fn handle_transfer(
                 id,
                 message: format!("Failed to compact session for transfer: {error}"),
                 retry_after_secs: None,
+                server_resumes: false,
             });
             return;
         }
@@ -878,6 +1037,7 @@ pub(super) async fn handle_transfer(
                     id,
                     message: format!("Failed to create transfer session: {error}"),
                     retry_after_secs: None,
+                    server_resumes: false,
                 });
                 return;
             }
@@ -1169,13 +1329,12 @@ pub(super) async fn handle_agent_task(
                 Some(ctx.swarm_event_tx),
             )
             .await;
-            let retry_after_secs = e
-                .downcast_ref::<StreamError>()
-                .and_then(|stream_error| stream_error.retry_after_secs);
+            let retry_after_secs = super::usage_limit_resume::error_retry_after_secs(&e);
             let _ = ctx.client_event_tx.send(ServerEvent::Error {
                 id,
                 message: crate::util::format_error_chain(&e),
                 retry_after_secs,
+                server_resumes: false,
             });
         }
     }

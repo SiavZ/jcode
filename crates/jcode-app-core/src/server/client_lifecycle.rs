@@ -2,14 +2,15 @@ use super::available_models_dedup::available_models_dedup_key;
 use super::client_actions::{
     AgentTaskContext, NotifySessionContext, handle_agent_task, handle_compact, handle_input_shell,
     handle_notify_session, handle_rename_session, handle_run_subagent, handle_set_feature,
-    handle_set_subagent_model, handle_split, handle_stdin_response, handle_transfer,
-    handle_trigger_memory_extraction,
+    handle_set_session_saved, handle_set_subagent_model, handle_split, handle_stdin_response,
+    handle_transfer, handle_trigger_memory_extraction,
 };
 use super::client_comm::{
     handle_comm_channel_members, handle_comm_list, handle_comm_list_channels, handle_comm_message,
     handle_comm_read, handle_comm_share, handle_comm_subscribe_channel,
     handle_comm_unsubscribe_channel,
 };
+use super::client_comm_swarms::{handle_comm_list_swarms, handle_comm_set_swarm_label};
 use super::client_disconnect_cleanup::{cleanup_client_connection, detach_client_attachment};
 use super::client_lifecycle_logging::{
     ServerRequestLifecycleFields, interrupt_request_log_fields, request_payload_summary,
@@ -39,11 +40,15 @@ use super::comm_sync::{
     handle_comm_resync_plan, handle_comm_status, handle_comm_summary,
 };
 use super::provider_control::{
-    handle_cycle_model, handle_notify_auth_changed, handle_refresh_models,
-    handle_set_compaction_mode, handle_set_model, handle_set_premium_mode,
-    handle_set_reasoning_effort, handle_set_route, handle_set_service_tier, handle_set_transport,
-    handle_switch_anthropic_account, handle_switch_openai_account,
-    try_available_models_updated_event,
+    apply_subscribe_account_pins, handle_set_account_failover, handle_set_default_account,
+    handle_set_session_account_request,
+};
+use super::provider_control::{
+    handle_cycle_model, handle_invalidate_anthropic_usage, handle_invalidate_openai_usage,
+    handle_notify_auth_changed, handle_refresh_models, handle_set_compaction_mode,
+    handle_set_model, handle_set_premium_mode, handle_set_reasoning_effort, handle_set_route,
+    handle_set_service_tier, handle_set_transport, handle_switch_anthropic_account,
+    handle_switch_openai_account, try_available_models_updated_event,
 };
 use super::{
     AwaitMembersRuntime, ClientConnectionInfo, ClientDebugState, FileTouchService,
@@ -61,7 +66,7 @@ use crate::tool::Registry;
 use crate::transport::Stream;
 use anyhow::Result;
 use futures::FutureExt;
-use jcode_agent_runtime::{InterruptSignal, SoftInterruptSource, StreamError};
+use jcode_agent_runtime::{InterruptSignal, SoftInterruptSource};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{
@@ -161,6 +166,18 @@ fn validated_subscribe_working_dir(
         ));
     }
     Ok(working_dir)
+}
+
+fn new_session_system_prompt<'a>(
+    provisional_session: bool,
+    target_session_id: Option<&str>,
+    system_prompt: Option<&'a str>,
+) -> Option<&'a str> {
+    if provisional_session && target_session_id.is_none() {
+        system_prompt
+    } else {
+        None
+    }
 }
 
 fn initial_subscribe_terminal_env(request: &Request) -> Vec<(String, String)> {
@@ -338,6 +355,7 @@ fn send_agent_busy_error(
             "Cannot handle {request_kind} while the session is busy. Try again after the current turn finishes."
         ),
         retry_after_secs: Some(1),
+        server_resumes: false,
     });
 }
 
@@ -489,7 +507,10 @@ pub(super) async fn handle_client(
         match decode_request(&line) {
             Ok(request) => {
                 if request.is_lightweight_control_request() {
-                    let keep_connection_open = matches!(request, Request::Ping { .. });
+                    let keep_connection_open = matches!(
+                        request,
+                        Request::Ping { .. } | Request::NotifyAuthChanged { .. }
+                    );
                     handle_lightweight_control_request(
                         request,
                         Arc::clone(&writer),
@@ -519,6 +540,9 @@ pub(super) async fn handle_client(
                     // Native SSH probes daemon capability before sending its
                     // Subscribe on this same stream. Ping must not consume the
                     // connection, unlike the other one-shot control requests.
+                    // The harness bridge may forward an auth-change notice
+                    // before its client attaches, so that must not close the
+                    // connection either. `jcode login` just hangs up after Done.
                     if keep_connection_open {
                         continue;
                     }
@@ -533,6 +557,7 @@ pub(super) async fn handle_client(
                         id: 0,
                         message: format!("Invalid request: {}", error),
                         retry_after_secs: None,
+                        server_resumes: false,
                     },
                 )
                 .await?;
@@ -553,6 +578,7 @@ pub(super) async fn handle_client(
                         id: initial_request.id(),
                         message,
                         retry_after_secs: None,
+                        server_resumes: false,
                     },
                 )
                 .await?;
@@ -572,6 +598,9 @@ pub(super) async fn handle_client(
     let mut continue_on_disconnect = false;
     let mut model_usage_updates_enabled = false;
     let mut supports_pdf_panels = false;
+    // Old clients count unknown events against a stray-line budget, so
+    // `session_account_changed` goes only to clients that opted in.
+    let supports_session_accounts = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Client selfdev status is determined by Subscribe request, not server's env
     let mut client_selfdev = false;
 
@@ -666,7 +695,9 @@ pub(super) async fn handle_client(
     )
     .await;
 
+    let agent_provider = new_agent.provider_handle();
     let mut agent = Arc::new(Mutex::new(new_agent));
+    super::client_state::register_agent_provider(&agent, agent_provider);
     {
         let mut sessions_guard = sessions.write().await;
         sessions_guard.insert(client_session_id.clone(), Arc::clone(&agent));
@@ -681,6 +712,7 @@ pub(super) async fn handle_client(
     );
 
     // Per-client event channel (not shared with other clients)
+    let _sdk_connection_guard = crate::tool::sdk::ConnectionGuard(client_connection_id.clone());
     let (client_event_tx, mut client_event_rx) =
         tokio::sync::mpsc::unbounded_channel::<ServerEvent>();
 
@@ -688,8 +720,14 @@ pub(super) async fn handle_client(
     let writer_clone = Arc::clone(&writer);
     let client_connection_id_for_events = client_connection_id.clone();
     let client_connections_for_events = Arc::clone(&client_connections);
+    let supports_session_accounts_for_events = Arc::clone(&supports_session_accounts);
     let event_handle = tokio::spawn(async move {
         while let Some(event) = client_event_rx.recv().await {
+            if matches!(event, ServerEvent::SessionAccountChanged { .. })
+                && !supports_session_accounts_for_events.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                continue;
+            }
             {
                 let mut connections = client_connections_for_events.write().await;
                 if let Some(info) = connections.get_mut(&client_connection_id_for_events) {
@@ -925,6 +963,15 @@ pub(super) async fn handle_client(
                         let _ = client_event_tx.send(event);
                         last_available_models_snapshot = Some(dedup_key);
                     }
+                    Ok(BusEvent::CredentialsChanged {
+                        provider,
+                        account_label,
+                    }) => {
+                        let _ = client_event_tx.send(ServerEvent::CredentialsChanged {
+                            provider,
+                            account_label,
+                        });
+                    }
                     Ok(BusEvent::BatchProgress(progress)) => {
                         if progress.session_id == client_session_id {
                             let _ = client_event_tx.send(ServerEvent::BatchProgress { progress });
@@ -936,6 +983,14 @@ pub(super) async fn handle_client(
                                 snapshot: super::client_writer::side_panel_for_client(
                                     update.snapshot, supports_pdf_panels,
                                 ),
+                            });
+                        }
+                    }
+                    Ok(BusEvent::AppletsUpdated(update)) => {
+                        if update.session_id == client_session_id {
+                            let _ = client_event_tx.send(ServerEvent::AppletState {
+                                session_id: update.session_id,
+                                snapshot: update.snapshot,
                             });
                         }
                     }
@@ -978,6 +1033,7 @@ pub(super) async fn handle_client(
                         id: 0,
                         message: format!("Invalid request: {}", e),
                         retry_after_secs: None,
+                        server_resumes: false,
                     };
                     let json = encode_event(&event);
                     let mut w = writer.lock().await;
@@ -1103,6 +1159,41 @@ pub(super) async fn handle_client(
             continue;
         }
 
+        // SDK controls reply only after validation. Callback results must never
+        // wait for the Agent mutex held by the turn awaiting that callback.
+        if matches!(&request, Request::ConfigureTools { .. } | Request::ListTools { .. } | Request::ToolResult { .. }) {
+            let id = request.id();
+            let response: anyhow::Result<ServerEvent> = match request {
+                Request::ToolResult { call_id, output, error, .. } => {
+                    crate::tool::sdk::complete(&client_connection_id, &client_session_id, &call_id, output, error)
+                        .map(|()| ServerEvent::Ack { id })
+                }
+                Request::ConfigureTools { tools, .. } => {
+                    if client_is_processing || crate::turn_cancel_registry::has_active_turn(&client_session_id) { Err(anyhow::anyhow!("Session is busy")) }
+                    else if let Ok(mut locked) = agent.try_lock() {
+                        let result = crate::tool::sdk::configure(locked.session_id(), &client_connection_id, tools, client_event_tx.clone());
+                        if result.is_ok() {
+                            locked.invalidate_sdk_tools();
+                            // Queue the acknowledgment before releasing the session lock,
+                            // so a second client cannot start a new-policy call first.
+                            let _ = client_event_tx.send(ServerEvent::Ack { id });
+                            continue;
+                        }
+                        result.map(|()| ServerEvent::Ack { id })
+                    } else { Err(anyhow::anyhow!("Session is busy")) }
+                }
+                Request::ListTools { .. } => {
+                    if let Ok(locked) = agent.try_lock() {
+                        Ok(ServerEvent::Tools { id, tools: crate::tool::sdk::wire_definitions(locked.tool_definitions_for_debug().await) })
+                    } else { Err(anyhow::anyhow!("Session is busy")) }
+                }
+                _ => unreachable!(),
+            };
+            let event = response.unwrap_or_else(|error| ServerEvent::Error { id, message: error.to_string(), retry_after_secs: None, server_resumes: false });
+            let _ = client_event_tx.send(event);
+            continue;
+        }
+
         // Send ack
         let ack = ServerEvent::Ack { id: request.id() };
         let json = encode_event(&ack);
@@ -1176,10 +1267,13 @@ pub(super) async fn handle_client(
         ).await {
             let _ = client_event_tx.send(ServerEvent::Error {
                 id: request.id(), message, retry_after_secs: None,
+                server_resumes: false,
             });
             continue;
         }
+        let sdk_session_before_request = client_session_id.clone();
         match request {
+            Request::ConfigureTools { .. } | Request::ListTools { .. } | Request::ToolResult { .. } => unreachable!("SDK controls dispatched before acknowledgment"),
             Request::Message {
                 id,
                 content,
@@ -1201,6 +1295,9 @@ pub(super) async fn handle_client(
                     .await;
                     continue;
                 }
+                // The user's message supersedes a server-initiated turn that
+                // is waiting for a usage-limit reset.
+                super::usage_limit_resume::cancel_pending_resume(&client_session_id);
                 if !client_is_processing {
                     // A live resume cannot replace stdin routing while the old
                     // turn owns the agent. Restore it when this client starts a
@@ -1300,10 +1397,8 @@ pub(super) async fn handle_client(
                         active_turn_registered,
                         session_connection_busy,
                     );
-                    if start {
-                        if let Some(info) = connections.get_mut(&client_connection_id) {
-                            info.is_processing = true;
-                        }
+                    if start && let Some(info) = connections.get_mut(&client_connection_id) {
+                        info.is_processing = true;
                     }
                     start
                 };
@@ -1416,6 +1511,7 @@ pub(super) async fn handle_client(
                         id,
                         message: "Cannot rewind while a turn is processing.".to_string(),
                         retry_after_secs: None,
+                        server_resumes: false,
                     });
                     continue;
                 }
@@ -1466,6 +1562,7 @@ pub(super) async fn handle_client(
                             id,
                             message,
                             retry_after_secs: None,
+                            server_resumes: false,
                         });
                     }
                 }
@@ -1477,6 +1574,7 @@ pub(super) async fn handle_client(
                         id,
                         message: "Cannot undo rewind while a turn is processing.".to_string(),
                         retry_after_secs: None,
+                        server_resumes: false,
                     });
                     continue;
                 }
@@ -1526,13 +1624,14 @@ pub(super) async fn handle_client(
                             id,
                             message,
                             retry_after_secs: None,
+                            server_resumes: false,
                         });
                     }
                 }
             }
 
             Request::Ping { id } => {
-                let json = encode_event(&ServerEvent::Pong { id, native_ssh_protocol: Some(1) });
+                let json = encode_event(&ServerEvent::Pong { id, native_ssh_protocol: Some(1), capabilities: vec!["session_tools".into()] });
                 let mut w = writer.lock().await;
                 if w.write_all(json.as_bytes()).await.is_err() {
                     break;
@@ -1540,6 +1639,7 @@ pub(super) async fn handle_client(
             }
 
             Request::PrepareDisconnect { id } => {
+                drop(crate::tool::sdk::ConnectionGuard(client_connection_id.clone()));
                 let json = encode_event(&ServerEvent::Done { id });
                 let mut w = writer.lock().await;
                 if w.write_all(json.as_bytes()).await.is_err() {
@@ -1564,6 +1664,7 @@ pub(super) async fn handle_client(
 
             Request::Subscribe {
                 id,
+                system_prompt,
                 supports_pdf_panels: requested_pdf_panels,
                 working_dir: subscribe_working_dir,
                 selfdev,
@@ -1574,6 +1675,8 @@ pub(super) async fn handle_client(
                 crash_on_disconnect: _,
                 continue_on_disconnect: requested_continuation,
                 terminal_env,
+                account_pins: requested_account_pins,
+                supports_session_accounts: requested_session_accounts,
             } => {
                 if let Err(message) =
                     validated_subscribe_working_dir(
@@ -1584,14 +1687,28 @@ pub(super) async fn handle_client(
                         id,
                         message,
                         retry_after_secs: None,
+                        server_resumes: false,
                     });
                     continue;
+                }
+                // Overrides are creation-only. In particular, never apply one to
+                // a target attachment or a repeated Subscribe on this connection.
+                if let Some(prompt) = new_session_system_prompt(
+                    provisional_session,
+                    target_session_id.as_deref(),
+                    system_prompt.as_deref(),
+                ) {
+                    agent.lock().await.set_system_prompt(prompt);
                 }
                 // Every Subscribe carries an authoritative snapshot. An empty
                 // snapshot must clear terminal vars inherited by the daemon
                 // rather than retaining a prior pane's values.
                 continue_on_disconnect = requested_continuation;
                 supports_pdf_panels = requested_pdf_panels;
+                supports_session_accounts.store(
+                    requested_session_accounts,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 active_terminal_env = terminal_env;
                 current_client_instance_id = client_instance_id.clone();
                 {
@@ -1759,6 +1876,11 @@ pub(super) async fn handle_client(
                         last_available_models_snapshot = Some(snapshot);
                     }
                 }
+                // `--account` pins apply to the session this connection now
+                // drives (new or resumed). An explicit request overrides a
+                // resumed session's stored pin.
+                apply_subscribe_account_pins(&agent, &requested_account_pins, &client_event_tx).await;
+                send_pending_account_notices(&agent, &client_event_tx);
                 client_subscribed = true;
                 provisional_session = false;
             }
@@ -1831,6 +1953,7 @@ pub(super) async fn handle_client(
                     id,
                     message: "debug_command is only supported on the debug socket".to_string(),
                     retry_after_secs: None,
+                    server_resumes: false,
                 });
             }
 
@@ -1908,6 +2031,7 @@ pub(super) async fn handle_client(
                 if client_session_id != pre_resume_session_id {
                     provisional_session = false;
                 }
+                send_pending_account_notices(&agent, &client_event_tx);
                 session_control = refresh_session_control_handle(
                     &client_session_id,
                     &agent,
@@ -1952,6 +2076,17 @@ pub(super) async fn handle_client(
 
             Request::SetRoute { id, selection } => {
                 handle_set_route(id, selection, &agent, &client_event_tx).await;
+            }
+
+            Request::SetAgentModel { id, target, model } => {
+                let result = super::client_actions::set_session_agent_model(
+                    &agent, &client_session_id, &target, model,
+                ).await;
+                let event = match result {
+                    Ok(overrides) => ServerEvent::AgentModelsChanged { id, session_id: client_session_id.clone(), overrides },
+                    Err(error) => ServerEvent::Error { id, message: error.to_string(), retry_after_secs: None, server_resumes: false },
+                };
+                let _ = client_event_tx.send(event);
             }
 
             Request::SetSubagentModel { id, model } => {
@@ -2020,6 +2155,29 @@ pub(super) async fn handle_client(
                 handle_set_compaction_mode(id, mode, &agent, &client_event_tx).await;
             }
 
+            Request::SetSessionSaved { id, saved, label } => {
+                if reject_if_agent_busy_for_request(
+                    id,
+                    "set_session_saved",
+                    &client_session_id,
+                    client_is_processing,
+                    &agent,
+                    &client_event_tx,
+                ) {
+                    continue;
+                }
+                handle_set_session_saved(
+                    id,
+                    saved,
+                    label,
+                    &agent,
+                    &client_session_id,
+                    &swarm_members,
+                    &client_event_tx,
+                )
+                .await;
+            }
+
             Request::RenameSession { id, title } => {
                 if reject_if_agent_busy_for_request(
                     id,
@@ -2064,11 +2222,69 @@ pub(super) async fn handle_client(
             }
 
             Request::SwitchAnthropicAccount { id, label } => {
-                handle_switch_anthropic_account(id, label, &agent, &client_event_tx).await;
+                handle_switch_anthropic_account(
+                    id,
+                    label,
+                    &agent,
+                    &client_event_tx,
+                    supports_session_accounts.load(std::sync::atomic::Ordering::Relaxed),
+                )
+                .await;
             }
 
             Request::SwitchOpenAiAccount { id, label } => {
-                handle_switch_openai_account(id, label, &agent, &client_event_tx).await;
+                handle_switch_openai_account(
+                    id,
+                    label,
+                    &agent,
+                    &client_event_tx,
+                    supports_session_accounts.load(std::sync::atomic::Ordering::Relaxed),
+                )
+                .await;
+            }
+
+            Request::SetSessionAccount {
+                id,
+                provider,
+                label,
+            } => {
+                handle_set_session_account_request(
+                    id,
+                    provider,
+                    label,
+                    &agent,
+                    &client_event_tx,
+                    supports_session_accounts.load(std::sync::atomic::Ordering::Relaxed),
+                )
+                .await;
+            }
+
+            Request::SetDefaultAccount {
+                id,
+                provider,
+                label,
+            } => {
+                handle_set_default_account(
+                    id,
+                    provider,
+                    label,
+                    &agent,
+                    &client_event_tx,
+                    supports_session_accounts.load(std::sync::atomic::Ordering::Relaxed),
+                )
+                .await;
+            }
+
+            Request::SetAccountFailover { id, enabled } => {
+                handle_set_account_failover(id, enabled, &agent, &client_event_tx).await;
+            }
+
+            Request::InvalidateOpenAiUsage { id, account_label } => {
+                handle_invalidate_openai_usage(id, account_label, &client_event_tx).await;
+            }
+
+            Request::InvalidateAnthropicUsage { id, account_label } => {
+                handle_invalidate_anthropic_usage(id, account_label, &client_event_tx).await;
             }
 
             Request::SetFeature {
@@ -2205,6 +2421,49 @@ pub(super) async fn handle_client(
                 .await;
             }
 
+            Request::AppletAction {
+                id,
+                session_id,
+                instance,
+                action,
+                state,
+                source_key,
+            } => {
+                super::client_actions::handle_applet_action(
+                    id,
+                    session_id,
+                    instance,
+                    action,
+                    state,
+                    source_key,
+                    NotifySessionContext {
+                        sessions: &sessions,
+                        soft_interrupt_queues: &soft_interrupt_queues,
+                        client_connections: &client_connections,
+                        swarm_members: &swarm_members,
+                        swarms_by_id: &swarms_by_id,
+                        event_history: &event_history,
+                        event_counter: &event_counter,
+                        swarm_event_tx: &swarm_event_tx,
+                        client_event_tx: &client_event_tx,
+                    },
+                )
+                .await;
+            }
+
+            Request::CloseApplet {
+                id,
+                session_id,
+                instance,
+            } => {
+                super::client_actions::handle_close_applet(
+                    id,
+                    session_id,
+                    instance,
+                    &client_event_tx,
+                );
+            }
+
             Request::Transcript {
                 id,
                 text,
@@ -2230,6 +2489,7 @@ pub(super) async fn handle_client(
                             id,
                             message: error.to_string(),
                             retry_after_secs: None,
+                            server_resumes: false,
                         });
                     }
                 }
@@ -2289,6 +2549,7 @@ pub(super) async fn handle_client(
                 delivery,
                 wake,
                 tldr,
+                to_swarm,
             } => {
                 handle_comm_message(
                     id,
@@ -2299,6 +2560,7 @@ pub(super) async fn handle_client(
                     delivery,
                     wake,
                     tldr,
+                    to_swarm,
                     &client_event_tx,
                     &sessions,
                     &soft_interrupt_queues,
@@ -2326,6 +2588,41 @@ pub(super) async fn handle_client(
                     &file_touch,
                     &sessions,
                     &client_connections,
+                )
+                .await;
+            }
+
+            Request::CommListSwarms {
+                id,
+                session_id: req_session_id,
+            } => {
+                handle_comm_list_swarms(
+                    id,
+                    req_session_id,
+                    &client_event_tx,
+                    &swarm_members,
+                    &swarms_by_id,
+                    &swarm_coordinators,
+                )
+                .await;
+            }
+
+            Request::CommSetSwarmLabel {
+                id,
+                session_id: req_session_id,
+                label,
+            } => {
+                handle_comm_set_swarm_label(
+                    id,
+                    req_session_id,
+                    label,
+                    &client_event_tx,
+                    &swarm_members,
+                    &swarms_by_id,
+                    &swarm_coordinators,
+                    &event_history,
+                    &event_counter,
+                    &swarm_event_tx,
                 )
                 .await;
             }
@@ -2946,6 +3243,9 @@ pub(super) async fn handle_client(
                 handle_client_debug_response(id, output, &client_debug_response_tx);
             }
         }
+        if sdk_session_before_request != client_session_id {
+            drop(crate::tool::sdk::ConnectionGuard(client_connection_id.clone()));
+        }
         if request_lifecycle_logged {
             log_request_lifecycle_handled(
                 ServerRequestLifecycleFields {
@@ -2969,7 +3269,50 @@ pub(super) async fn handle_client(
     Ok(())
     }.await;
 
-    if continue_on_disconnect {
+    drop(_sdk_connection_guard);
+
+    // Cleanup serializes the successor decision against live attachment claims.
+    // A successor must inherit the active owner, including its completion receiver,
+    // rather than just an Agent whose processing task was already aborted.
+    let event_handle = if !continue_on_disconnect {
+        let retained = crate::hooks::with_client_terminal_env(
+            active_terminal_env.clone(),
+            cleanup_client_connection(
+                &sessions,
+                &client_session_id,
+                client_is_processing,
+                &mut processing_task,
+                event_handle,
+                &swarm_members,
+                &swarms_by_id,
+                &swarm_coordinators,
+                &swarm_plans,
+                &file_touch,
+                &channel_subscriptions,
+                &channel_subscriptions_by_session,
+                &client_debug_state,
+                &client_debug_id,
+                &client_connections,
+                &client_connection_id,
+                &shutdown_signals,
+                &soft_interrupt_queues,
+                &event_history,
+                &event_counter,
+                &swarm_event_tx,
+                &client_event_tx,
+                super::client_disconnect_cleanup::IDLE_RECONNECT_GRACE,
+            ),
+        )
+        .await?;
+        match retained {
+            Some(handle) => handle,
+            None => return connection_result,
+        }
+    } else {
+        event_handle
+    };
+
+    {
         // Retain the existing turn owner, not the socket. Its JoinHandle and
         // completion receiver stay alive so normal finalization still runs and
         // the daemon cannot idle-shutdown midway through remote work. New
@@ -2993,7 +3336,7 @@ pub(super) async fn handle_client(
         stdin_responses.lock().await.clear();
         if let Some(handle) = processing_task.take() {
             crate::logging::info(&format!(
-                "Retaining disconnected remote turn for session {}",
+                "Retaining disconnected turn for session {}",
                 client_session_id
             ));
             let _ = handle.await;
@@ -3097,9 +3440,7 @@ async fn record_processing_completion(
                 )
                 .await;
             }
-            let retry_after_secs = e
-                .downcast_ref::<StreamError>()
-                .and_then(|se| se.retry_after_secs);
+            let retry_after_secs = super::usage_limit_resume::error_retry_after_secs(&e);
             if retry_after_secs.is_some() {
                 crate::telemetry::record_error(crate::telemetry::ErrorCategory::RateLimited);
             } else {
@@ -3150,6 +3491,7 @@ async fn append_context_message(
             id,
             message: crate::util::format_error_chain(&error),
             retry_after_secs: None,
+            server_resumes: false,
         },
     };
     let _ = client_event_tx.send(event);
@@ -3187,6 +3529,7 @@ async fn start_processing_message(
             id,
             message: "Already processing a message".to_string(),
             retry_after_secs: None,
+            server_resumes: false,
         });
         return;
     }
@@ -3201,6 +3544,7 @@ async fn start_processing_message(
             id,
             message: format!("Skill '{skill_name}' is not installed on the server"),
             retry_after_secs: None,
+            server_resumes: false,
         });
         return;
     }
@@ -3249,6 +3593,7 @@ async fn start_processing_message(
     crate::logging::info(&format!("Processing message id={} spawning task", id));
     *state.task = Some(tokio::spawn(async move {
         let event_tx = tx.clone();
+        let mut stop_reason = crate::protocol::TurnStopReason::Failure;
         let result = match std::panic::AssertUnwindSafe(crate::hooks::with_client_terminal_env(
             client_terminal_env,
             process_message_streaming_mpsc(agent, &content, images, system_reminder, event_tx),
@@ -3258,6 +3603,7 @@ async fn start_processing_message(
         {
             Ok(result) => result,
             Err(panic_payload) => {
+                stop_reason = crate::protocol::TurnStopReason::Crash;
                 let msg = if let Some(text) = panic_payload.downcast_ref::<&str>() {
                     text.to_string()
                 } else if let Some(text) = panic_payload.downcast_ref::<String>() {
@@ -3291,14 +3637,22 @@ async fn start_processing_message(
         // Keep the terminal event on the same ordered fanout channel as the
         // stream. Sending it later from the owning client's event loop could
         // race ahead of the final MessageEnd for newly attached clients.
+        if let Err(error) = &result {
+            let _ = tx.send(ServerEvent::TurnStopped {
+                reason: stop_reason,
+                message: crate::util::format_error_chain(error),
+                provider_stop_reason: None,
+            });
+        }
         let terminal_event = match &result {
             Ok(()) => ServerEvent::Done { id },
             Err(error) => ServerEvent::Error {
                 id,
                 message: crate::util::format_error_chain(error),
-                retry_after_secs: error
-                    .downcast_ref::<StreamError>()
-                    .and_then(|stream_error| stream_error.retry_after_secs),
+                // A usage limit carries its reset so the client holds the
+                // turn and resends at the reset.
+                retry_after_secs: super::usage_limit_resume::error_retry_after_secs(error),
+                server_resumes: false,
             },
         };
         let _ = tx.send(terminal_event);
@@ -3341,6 +3695,18 @@ async fn cancel_processing_message(
             ));
             *state.task = Some(handle);
             return;
+        }
+        let stopped = ServerEvent::TurnStopped {
+            reason: crate::protocol::TurnStopReason::Interrupted,
+            message: "The turn was interrupted by a cancellation request.".into(),
+            provider_stop_reason: None,
+        };
+        // Publish before signalling: the worker can finish cooperatively and
+        // emit Done immediately after request_cancel.
+        if super::state::fanout_session_event(swarm.members, &session_label, stopped.clone()).await
+            == 0
+        {
+            let _ = client_event_tx.send(stopped);
         }
         let cancel_epoch = session_control.request_cancel();
         crate::logging::info(&format!(
@@ -3440,6 +3806,18 @@ async fn cancel_processing_message(
             }
             return;
         }
+        let stopped = ServerEvent::TurnStopped {
+            reason: crate::protocol::TurnStopReason::Interrupted,
+            message: "The turn was interrupted by a cancellation request.".into(),
+            provider_stop_reason: None,
+        };
+        // Publish before signalling: the worker can finish cooperatively and
+        // emit Done immediately after request_cancel.
+        if super::state::fanout_session_event(swarm.members, &session_label, stopped.clone()).await
+            == 0
+        {
+            let _ = client_event_tx.send(stopped);
+        }
         let cancel_epoch = session_control.request_cancel();
         let reset_control = session_control.clone();
         tokio::spawn(async move {
@@ -3513,6 +3891,19 @@ fn names_only_available_models_event(event: &ServerEvent) -> Option<ServerEvent>
         available_models: available_models.clone(),
         available_model_routes: Vec::new(),
     })
+}
+
+/// Tell the client about account pins restore had to drop for the session it
+/// now drives. A busy agent keeps them; its next turn announces them.
+fn send_pending_account_notices(
+    agent: &Arc<Mutex<Agent>>,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    if let Ok(mut agent_guard) = agent.try_lock() {
+        for notice in agent_guard.take_account_notices() {
+            let _ = client_event_tx.send(notice);
+        }
+    }
 }
 
 fn queue_soft_interrupt(
@@ -3634,3 +4025,7 @@ mod tests;
 #[cfg(test)]
 #[path = "client_target_attach_tests.rs"]
 mod target_attach_tests;
+
+#[cfg(test)]
+#[path = "session_accounts_tests.rs"]
+mod session_accounts_tests;

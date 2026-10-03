@@ -114,6 +114,29 @@ fn test_notify_auth_changed_provider_hint_is_optional() -> Result<()> {
 }
 
 #[test]
+fn test_invalidate_openai_usage_roundtrip_pins_account_scope() -> Result<()> {
+    for account_label in [None, Some("reset-target".to_string())] {
+        let request = Request::InvalidateOpenAiUsage {
+            id: 41,
+            account_label: account_label.clone(),
+        };
+        let json = serde_json::to_string(&request)?;
+        assert!(json.contains("\"type\":\"invalidate_openai_usage\""));
+        let decoded = parse_request_json(&json)?;
+        assert_eq!(decoded.id(), 41);
+        let Request::InvalidateOpenAiUsage {
+            account_label: decoded_label,
+            ..
+        } = decoded
+        else {
+            return Err(anyhow!("wrong request type"));
+        };
+        assert_eq!(decoded_label, account_label);
+    }
+    Ok(())
+}
+
+#[test]
 fn test_notify_auth_changed_typed_auth_payload_roundtrip() -> Result<()> {
     let req = Request::NotifyAuthChanged {
         id: 11,
@@ -419,6 +442,7 @@ fn test_history_event_decodes_without_compaction_mode_for_older_servers() -> Res
         connection_type,
         compaction_mode,
         side_panel,
+        agent_model_overrides,
         ..
     } = decoded
     else {
@@ -433,6 +457,7 @@ fn test_history_event_decodes_without_compaction_mode_for_older_servers() -> Res
         jcode_config_types::CompactionMode::Reactive
     );
     assert!(!side_panel.has_pages());
+    assert!(agent_model_overrides.is_empty());
     Ok(())
 }
 
@@ -480,11 +505,14 @@ fn test_history_event_roundtrip_preserves_side_panel_snapshot() -> Result<()> {
         resolved_credential: None,
         reasoning_effort: None,
         service_tier: None,
+        account_labels: Vec::new(),
         subagent_model: None,
+        agent_model_overrides: Default::default(),
         autoreview_enabled: None,
         autojudge_enabled: None,
         compaction_mode: jcode_config_types::CompactionMode::Reactive,
         activity: None,
+        applets: Default::default(),
         side_panel: jcode_side_panel_types::SidePanelSnapshot {
             focus_revision: 0,
             focused_page_id: Some("page-1".to_string()),
@@ -611,6 +639,7 @@ fn test_error_event_retry_after_roundtrip() -> Result<()> {
         id: 42,
         message: "rate limited".to_string(),
         retry_after_secs: Some(17),
+        server_resumes: false,
     };
     let json = encode_event(&event);
     let decoded = parse_event_json(json.trim())?;
@@ -618,6 +647,7 @@ fn test_error_event_retry_after_roundtrip() -> Result<()> {
         id,
         message,
         retry_after_secs,
+        ..
     } = decoded
     else {
         return Err(anyhow!("wrong event type"));
@@ -636,6 +666,7 @@ fn test_error_event_retry_after_back_compat_default() -> Result<()> {
         id,
         message,
         retry_after_secs,
+        ..
     } = decoded
     else {
         return Err(anyhow!("wrong event type"));
@@ -643,5 +674,31 @@ fn test_error_event_retry_after_back_compat_default() -> Result<()> {
     assert_eq!(id, 7);
     assert_eq!(message, "oops");
     assert_eq!(retry_after_secs, None);
+    Ok(())
+}
+
+#[test]
+fn test_agent_models_session_setter_and_response_roundtrip() -> Result<()> {
+    let clear = parse_request_json(r#"{"type":"set_agent_model","id":31,"target":"swarm"}"#)?;
+    assert!(matches!(clear, Request::SetAgentModel { model: None, .. }));
+    let request = Request::SetAgentModel {
+        id: 32,
+        target: "review".into(),
+        model: Some("inherit".into()),
+    };
+    let decoded = parse_request_json(&serde_json::to_string(&request)?)?;
+    assert!(
+        matches!(decoded, Request::SetAgentModel { model: Some(model), .. } if model == "inherit")
+    );
+    let event = ServerEvent::AgentModelsChanged {
+        id: 32,
+        session_id: "session-a".into(),
+        overrides: std::collections::BTreeMap::from([("review".into(), "inherit".into())]),
+    };
+    let decoded = parse_event_json(encode_event(&event).trim())?;
+    assert!(
+        matches!(decoded, ServerEvent::AgentModelsChanged { session_id, overrides, .. }
+        if session_id == "session-a" && overrides.get("review").map(String::as_str) == Some("inherit"))
+    );
     Ok(())
 }

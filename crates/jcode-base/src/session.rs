@@ -2,8 +2,8 @@ use crate::id::{extract_session_name, new_id, new_memorable_session_id_avoiding}
 use crate::message::{ContentBlock, Message, Role};
 pub use crate::storage::{
     SessionCounts, SessionPresence, active_session_ids, find_active_session_id_by_pid,
-    mark_streaming, session_counts, session_presence, unmark_streaming, user_session_counts,
-    user_session_presence,
+    mark_streaming, session_counts, session_presence, streaming_session_ids, unmark_streaming,
+    user_session_counts, user_session_presence,
 };
 use crate::storage::{active_pids_dir, register_active_pid, unregister_active_pid};
 
@@ -31,9 +31,13 @@ impl StreamingGuard {
 }
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
+
+pub use jcode_provider_core::AccountPin;
+mod agent_models;
 mod crash;
+pub use agent_models::AgentModelOverrides;
 mod journal;
 mod load_telemetry;
 mod maintenance;
@@ -46,6 +50,7 @@ pub use crash::{
     CrashedSessionsInfo, detect_crashed_sessions, find_recent_crashed_sessions,
     find_session_by_name_or_id, recover_crashed_sessions, recover_crashed_sessions_by_ids,
 };
+pub use jcode_session_types::prompt_title;
 pub use jcode_session_types::{
     EnvSnapshot, GitState, SessionImproveMode, SessionStatus, StoredCompactionState,
     StoredDisplayRole, StoredMemoryInjection, StoredMessage, StoredTokenUsage,
@@ -111,6 +116,9 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub messages: Vec<StoredMessage>,
+    /// Full assembled system prompt replacement, including an intentionally empty prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
     /// Durable logical input turn identity for per-route usage deduplication.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_usage_turn_id: Option<String>,
@@ -135,9 +143,22 @@ pub struct Session {
     /// Provider reasoning/thinking effort for this session (e.g., OpenAI low|medium|high|xhigh).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Per-provider account pins for this session ("claude" | "openai" -> pin).
+    /// Empty means the session follows the default account.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub account_pins: BTreeMap<String, AccountPin>,
+    /// Per-session same-provider account failover toggle. `None` = config default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_failover: Option<bool>,
+    /// Preferred pin to return to after an automatic failover move.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub account_failover_home: BTreeMap<String, AccountPin>,
     /// Optional fixed model to use for subagents launched from this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_model: Option<String>,
+    /// Session worker routing. Missing keys follow saved global defaults.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent_model_overrides: AgentModelOverrides,
     /// Last requested `/improve` mode for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub improve_mode: Option<SessionImproveMode>,
@@ -186,6 +207,10 @@ pub struct Session {
     /// Non-conversation UI/state events persisted for higher-fidelity replay.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub replay_events: Vec<StoredReplayEvent>,
+    /// Migration epoch of the machine move that delivered this copy
+    /// (`jcode cloud move` / `return`). Zero for sessions that never moved.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub migration_epoch: u64,
     #[serde(skip)]
     persist_state: SessionPersistState,
     #[serde(skip)]
@@ -211,6 +236,8 @@ struct SessionStartupStub {
     title: Option<String>,
     #[serde(default)]
     custom_title: Option<String>,
+    #[serde(default)]
+    system_prompt: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     #[serde(default)]
@@ -226,7 +253,15 @@ struct SessionStartupStub {
     #[serde(default)]
     reasoning_effort: Option<String>,
     #[serde(default)]
+    account_pins: BTreeMap<String, AccountPin>,
+    #[serde(default)]
+    account_failover: Option<bool>,
+    #[serde(default)]
+    account_failover_home: BTreeMap<String, AccountPin>,
+    #[serde(default)]
     subagent_model: Option<String>,
+    #[serde(default)]
+    agent_model_overrides: AgentModelOverrides,
     #[serde(default)]
     improve_mode: Option<SessionImproveMode>,
     #[serde(default)]
@@ -253,6 +288,8 @@ struct SessionStartupStub {
     saved: bool,
     #[serde(default)]
     save_label: Option<String>,
+    #[serde(default)]
+    migration_epoch: u64,
 }
 
 const MAX_SESSION_JOURNAL_BYTES: u64 = 512 * 1024;
@@ -277,6 +314,10 @@ fn env_flag_enabled(name: &str) -> bool {
 
 fn default_is_test_session() -> bool {
     env_flag_enabled("JCODE_TEST_SESSION")
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 pub fn derive_session_provider_key(provider_name: &str) -> Option<String> {
@@ -325,6 +366,7 @@ impl Session {
     fn session_from_startup_stub(stub: SessionStartupStub) -> Self {
         let mut session = Self::create_with_id(stub.id, stub.parent_id, stub.title);
         session.custom_title = stub.custom_title;
+        session.system_prompt = stub.system_prompt;
         session.created_at = stub.created_at;
         session.updated_at = stub.updated_at;
         session.compaction = stub.compaction;
@@ -333,7 +375,11 @@ impl Session {
         session.model = stub.model;
         session.route_api_method = stub.route_api_method;
         session.reasoning_effort = stub.reasoning_effort;
+        session.account_pins = stub.account_pins;
+        session.account_failover = stub.account_failover;
+        session.account_failover_home = stub.account_failover_home;
         session.subagent_model = stub.subagent_model;
+        session.agent_model_overrides = stub.agent_model_overrides;
         session.improve_mode = stub.improve_mode;
         session.autoreview_enabled = stub.autoreview_enabled;
         session.autojudge_enabled = stub.autojudge_enabled;
@@ -347,6 +393,7 @@ impl Session {
         session.is_debug = stub.is_debug;
         session.saved = stub.saved;
         session.save_label = stub.save_label;
+        session.migration_epoch = stub.migration_epoch;
         session.messages.clear();
         session.env_snapshots.clear();
         session.memory_injections.clear();
@@ -359,6 +406,7 @@ impl Session {
     fn session_from_remote_startup_snapshot(snapshot: RemoteStartupSessionSnapshot) -> Self {
         let mut session = Self::create_with_id(snapshot.id, snapshot.parent_id, snapshot.title);
         session.custom_title = snapshot.custom_title;
+        session.system_prompt = snapshot.system_prompt;
         session.created_at = snapshot.created_at;
         session.updated_at = snapshot.updated_at;
         session.messages = snapshot.messages;
@@ -368,7 +416,11 @@ impl Session {
         session.model = snapshot.model;
         session.route_api_method = snapshot.route_api_method;
         session.reasoning_effort = snapshot.reasoning_effort;
+        session.account_pins = snapshot.account_pins;
+        session.account_failover = snapshot.account_failover;
+        session.account_failover_home = snapshot.account_failover_home;
         session.subagent_model = snapshot.subagent_model;
+        session.agent_model_overrides = snapshot.agent_model_overrides;
         session.improve_mode = snapshot.improve_mode;
         session.autoreview_enabled = snapshot.autoreview_enabled;
         session.autojudge_enabled = snapshot.autojudge_enabled;
@@ -499,6 +551,7 @@ impl Session {
             parent_id: self.parent_id.clone(),
             title: self.title.clone(),
             custom_title: self.custom_title.clone(),
+            system_prompt: self.system_prompt.clone(),
             updated_at: self.updated_at,
             compaction: self.compaction.clone(),
             provider_session_id: self.provider_session_id.clone(),
@@ -506,7 +559,11 @@ impl Session {
             provider_key: self.provider_key.clone(),
             model: self.model.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
+            account_pins: self.account_pins.clone(),
+            account_failover: self.account_failover,
+            account_failover_home: self.account_failover_home.clone(),
             subagent_model: self.subagent_model.clone(),
+            agent_model_overrides: self.agent_model_overrides.clone(),
             improve_mode: self.improve_mode,
             autoreview_enabled: self.autoreview_enabled,
             autojudge_enabled: self.autojudge_enabled,
@@ -701,6 +758,7 @@ impl Session {
         self.parent_id = meta.parent_id;
         self.title = meta.title;
         self.custom_title = meta.custom_title;
+        self.system_prompt = meta.system_prompt;
         self.updated_at = meta.updated_at;
         self.compaction = meta.compaction;
         self.provider_session_id = meta.provider_session_id;
@@ -708,7 +766,11 @@ impl Session {
         self.provider_key = meta.provider_key;
         self.model = meta.model;
         self.reasoning_effort = meta.reasoning_effort;
+        self.account_pins = meta.account_pins;
+        self.account_failover = meta.account_failover;
+        self.account_failover_home = meta.account_failover_home;
         self.subagent_model = meta.subagent_model;
+        self.agent_model_overrides = meta.agent_model_overrides;
         self.improve_mode = meta.improve_mode;
         self.autoreview_enabled = meta.autoreview_enabled;
         self.autojudge_enabled = meta.autojudge_enabled;
@@ -742,6 +804,7 @@ impl Session {
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
+            system_prompt: None,
             model_usage_turn_id: None,
             compaction: None,
             provider_session_id: None,
@@ -749,7 +812,11 @@ impl Session {
             model: None,
             route_api_method: None,
             reasoning_effort: None,
+            account_pins: BTreeMap::new(),
+            account_failover: None,
+            account_failover_home: BTreeMap::new(),
             subagent_model: None,
+            agent_model_overrides: AgentModelOverrides::new(),
             improve_mode: None,
             autoreview_enabled: None,
             autojudge_enabled: None,
@@ -766,6 +833,7 @@ impl Session {
             env_snapshots: Vec::new(),
             memory_injections: Vec::new(),
             replay_events: Vec::new(),
+            migration_epoch: 0,
             persist_state: SessionPersistState::default(),
             provider_messages_cache: Vec::new(),
             provider_message_prefix_hashes_cache: Vec::new(),
@@ -797,6 +865,7 @@ impl Session {
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
+            system_prompt: None,
             model_usage_turn_id: None,
             compaction: None,
             provider_session_id: None,
@@ -804,7 +873,11 @@ impl Session {
             model: None,
             route_api_method: None,
             reasoning_effort: None,
+            account_pins: BTreeMap::new(),
+            account_failover: None,
+            account_failover_home: BTreeMap::new(),
             subagent_model: None,
+            agent_model_overrides: AgentModelOverrides::new(),
             improve_mode: None,
             autoreview_enabled: None,
             autojudge_enabled: None,
@@ -821,6 +894,7 @@ impl Session {
             env_snapshots: Vec::new(),
             memory_injections: Vec::new(),
             replay_events: Vec::new(),
+            migration_epoch: 0,
             persist_state: SessionPersistState::default(),
             provider_messages_cache: Vec::new(),
             provider_message_prefix_hashes_cache: Vec::new(),
@@ -843,11 +917,20 @@ impl Session {
         }
     }
 
-    /// Save/bookmark this session with an optional label
+    /// Save/bookmark this session with an optional label.
+    ///
+    /// A label is the name the user chose for the session, so it also becomes
+    /// the session's display title everywhere sessions are listed.
     pub fn mark_saved(&mut self, label: Option<String>) {
         self.saved = true;
-        if label.is_some() {
-            self.save_label = label;
+        let label = label.and_then(|label| {
+            let label = label.trim();
+            (!label.is_empty()).then(|| label.to_string())
+        });
+        if let Some(label) = label {
+            self.custom_title = Some(label.clone());
+            self.save_label = Some(label);
+            self.updated_at = Utc::now();
         }
     }
 
@@ -877,6 +960,12 @@ impl Session {
         }
 
         non_empty_trimmed(self.custom_title.as_deref())
+            .or_else(|| {
+                // Bookmarks labelled before labels doubled as titles.
+                self.saved
+                    .then(|| non_empty_trimmed(self.save_label.as_deref()))
+                    .flatten()
+            })
             .or_else(|| non_empty_trimmed(self.title.as_deref()))
     }
 
@@ -1048,6 +1137,12 @@ request in this new forked session, using the inherited conversation only as con
         self.status = SessionStatus::Error { message };
     }
 
+    /// Why this in-memory copy may not run turns or persist on this machine
+    /// because the session migrated (see `jcode_storage::session_lease`).
+    pub fn migration_lease_block(&self) -> Option<crate::storage::SessionLeaseBlock> {
+        crate::storage::session_lease_block(&self.id, self.migration_epoch)
+    }
+
     /// Mark session as active (e.g., when resuming)
     pub fn mark_active(&mut self) {
         self.status = SessionStatus::Active;
@@ -1152,8 +1247,11 @@ request in this new forked session, using the inherited conversation only as con
                         *content = crate::message::redact_secrets(content);
                     }
                     ContentBlock::ToolUse { input, .. } => redact_json_value(input),
+                    // Export copy only: the stored item stays verbatim for
+                    // replay, but queries can carry pasted credentials.
+                    ContentBlock::ProviderNative { item, .. } => redact_json_value(item),
                     ContentBlock::Image { .. } => {}
-                    ContentBlock::OpenAICompaction { .. } => {}
+                    ContentBlock::OpenAICompaction { .. } | ContentBlock::ToolReference { .. } => {}
                 }
             }
         }
@@ -1277,8 +1375,40 @@ request in this new forked session, using the inherited conversation only as con
         self.memory_profile_cache
             .message_stats
             .merge_from(&summarize_blocks(&message.content));
+        self.adopt_prompt_title(&message);
         self.messages.push(message);
         self.mark_messages_append_dirty();
+    }
+
+    /// Name an untitled session after its first real user prompt so lists show
+    /// something recognizable instead of a generic placeholder. Renames,
+    /// bookmark labels, and todo goals still take precedence at display time.
+    fn adopt_prompt_title(&mut self, message: &StoredMessage) {
+        if self.title.is_some()
+            || message.role != Role::User
+            || !is_visible_conversation_message(message)
+        {
+            return;
+        }
+        self.title = message.content.iter().find_map(|block| match block {
+            ContentBlock::Text { text, .. } => prompt_title(text),
+            _ => None,
+        });
+    }
+
+    /// Give sessions recorded before prompt titles existed the same fallback.
+    pub(crate) fn backfill_prompt_title(&mut self) {
+        if self.title.is_some() {
+            return;
+        }
+        let first_prompt = self
+            .messages
+            .iter()
+            .find(|message| message.role == Role::User && is_visible_conversation_message(message))
+            .cloned();
+        if let Some(message) = first_prompt {
+            self.adopt_prompt_title(&message);
+        }
     }
 
     pub fn insert_message(&mut self, index: usize, message: StoredMessage) {
@@ -1617,6 +1747,8 @@ struct RemoteStartupSessionSnapshot {
     title: Option<String>,
     #[serde(default)]
     custom_title: Option<String>,
+    #[serde(default)]
+    system_prompt: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     #[serde(default)]
@@ -1634,7 +1766,15 @@ struct RemoteStartupSessionSnapshot {
     #[serde(default)]
     reasoning_effort: Option<String>,
     #[serde(default)]
+    account_pins: BTreeMap<String, AccountPin>,
+    #[serde(default)]
+    account_failover: Option<bool>,
+    #[serde(default)]
+    account_failover_home: BTreeMap<String, AccountPin>,
+    #[serde(default)]
     subagent_model: Option<String>,
+    #[serde(default)]
+    agent_model_overrides: AgentModelOverrides,
     #[serde(default)]
     improve_mode: Option<SessionImproveMode>,
     #[serde(default)]

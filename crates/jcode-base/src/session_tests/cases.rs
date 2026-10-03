@@ -69,6 +69,28 @@ fn derive_session_provider_key_keeps_openai_compatible_profile_namespace() {
 }
 
 #[test]
+fn save_label_becomes_the_session_title() {
+    let mut session = Session::create_with_id(
+        "session_save_label_123".to_string(),
+        None,
+        Some("Generated title".to_string()),
+    );
+    session.mark_saved(None);
+    assert_eq!(session.display_title(), Some("Generated title"));
+
+    session.mark_saved(Some("  yc mcp  ".to_string()));
+    assert_eq!(session.save_label.as_deref(), Some("yc mcp"));
+    assert_eq!(session.custom_title.as_deref(), Some("yc mcp"));
+    assert_eq!(session.display_title(), Some("yc mcp"));
+
+    // Legacy bookmarks saved a label without setting the title.
+    session.custom_title = None;
+    assert_eq!(session.display_title(), Some("yc mcp"));
+    session.unmark_saved();
+    assert_eq!(session.display_title(), Some("Generated title"));
+}
+
+#[test]
 fn rename_title_preserves_generated_title_for_clear() {
     let mut session = Session::create_with_id(
         "session_rename_clear_123".to_string(),
@@ -1234,6 +1256,43 @@ fn test_redacted_for_export_redacts_tool_result_and_tool_input() -> Result<()> {
     assert!(!input_str.contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"));
     assert!(!input_str.contains("short-secret-value"));
     assert!(input_str.contains("fn add(a: i32, b: i32)"));
+    Ok(())
+}
+
+#[test]
+fn test_redacted_for_export_redacts_provider_native_items_only_in_copy() -> Result<()> {
+    let mut session = Session::create_with_id(
+        "session_redact_native_test".to_string(),
+        None,
+        Some("redaction test".to_string()),
+    );
+    let item = serde_json::json!({
+        "type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
+        "input": {"query": "why does ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 fail"}
+    });
+    session.add_message(
+        Role::Assistant,
+        vec![ContentBlock::ProviderNative {
+            provider: "anthropic".to_string(),
+            item: item.clone(),
+        }],
+    );
+
+    let persisted = session.redacted_for_export();
+    let ContentBlock::ProviderNative { item: exported, .. } = &persisted.messages[0].content[0]
+    else {
+        return Err(anyhow!("expected provider-native block"));
+    };
+    assert!(
+        !exported
+            .to_string()
+            .contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123")
+    );
+    // The live session keeps the item verbatim for replay.
+    let ContentBlock::ProviderNative { item: stored, .. } = &session.messages[0].content[0] else {
+        return Err(anyhow!("expected provider-native block"));
+    };
+    assert_eq!(stored, &item);
     Ok(())
 }
 
@@ -2701,4 +2760,144 @@ fn cache_prompt_totals_preserve_mixed_provider_accounting_and_legacy_unknown() {
     session.add_message_ext(Role::Assistant, vec![], None, Some(legacy));
     assert_eq!(session.token_usage_totals().cache_prompt_tokens, None);
     assert_eq!(session.token_usage_totals().cache_read_input_tokens, 19_000);
+}
+
+#[test]
+fn system_prompt_persists_before_first_message_and_across_metadata_updates() -> Result<()> {
+    let _lock = lock_env();
+    let home = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("JCODE_HOME", home.path());
+    for prompt in ["custom system prompt", ""] {
+        let mut session = Session::create(None, None);
+        assert_eq!(session.system_prompt, None);
+        session.system_prompt = Some(prompt.into());
+        session.save()?;
+        assert_eq!(
+            Session::load(&session.id)?.system_prompt.as_deref(),
+            Some(prompt)
+        );
+        assert_eq!(
+            Session::load_startup_stub(&session.id)?
+                .system_prompt
+                .as_deref(),
+            Some(prompt)
+        );
+        // Unchanged prompt survives metadata-only journal persistence too.
+        session.model = Some("test-model".into());
+        session.save()?;
+        assert_eq!(
+            Session::load(&session.id)?.system_prompt.as_deref(),
+            Some(prompt)
+        );
+        session.system_prompt = Some("replacement".into());
+        session.save()?;
+        assert_eq!(
+            Session::load_startup_stub(&session.id)?
+                .system_prompt
+                .as_deref(),
+            Some("replacement")
+        );
+        session.system_prompt = None;
+        session.save()?;
+        assert_eq!(Session::load(&session.id)?.system_prompt, None);
+    }
+    Ok(())
+}
+
+#[test]
+fn system_prompt_missing_in_legacy_session_defaults_to_none() -> Result<()> {
+    let session = Session::create_with_id("legacy-prompt-test".into(), None, None);
+    let json = serde_json::to_value(&session)?;
+    assert!(json.get("system_prompt").is_none());
+    let restored: Session = serde_json::from_value(json)?;
+    assert_eq!(restored.system_prompt, None);
+    Ok(())
+}
+
+#[test]
+fn first_visible_user_prompt_becomes_the_generated_title() {
+    let mut session = Session::create_with_id("session_prompt_title_1".to_string(), None, None);
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "<system-reminder>\n# Session Context\n</system-reminder>".into(),
+            cache_control: None,
+        }],
+    );
+    session.add_message_with_display_role(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "background finished".into(),
+            cache_control: None,
+        }],
+        Some(StoredDisplayRole::BackgroundTask),
+    );
+    assert_eq!(session.title, None);
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "<transcription>\nFix the   sidebar names\n</transcription>".into(),
+            cache_control: None,
+        }],
+    );
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "second prompt".into(),
+            cache_control: None,
+        }],
+    );
+    assert_eq!(session.display_title(), Some("Fix the sidebar names"));
+
+    session.rename_title(Some("Custom".into()));
+    assert_eq!(session.display_title(), Some("Custom"));
+}
+
+#[test]
+fn account_pins_persist_through_snapshot_and_journal() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-account-pins-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let session_id = "session_account_pins_roundtrip";
+    let mut session = Session::create_with_id(session_id.to_string(), None, None);
+    session.save_prepared()?;
+
+    // Second save goes through the journal meta path.
+    let fox = AccountPin::new("claude-fox", Some("fox@example.com".to_string()));
+    session
+        .account_pins
+        .insert("claude".to_string(), fox.clone());
+    session.account_failover = Some(false);
+    session
+        .account_failover_home
+        .insert("claude".to_string(), AccountPin::new("claude-otter", None));
+    session.save_prepared()?;
+
+    let loaded = Session::load(session_id)?;
+    assert_eq!(loaded.account_pins.get("claude"), Some(&fox));
+    assert_eq!(loaded.account_failover, Some(false));
+    assert_eq!(
+        loaded
+            .account_failover_home
+            .get("claude")
+            .map(|p| p.label.as_str()),
+        Some("claude-otter")
+    );
+
+    let remote = Session::load_for_remote_startup(session_id)?;
+    assert_eq!(remote.account_pins.get("claude"), Some(&fox));
+    assert_eq!(remote.account_failover, Some(false));
+
+    // Old session JSON without the fields still loads with empty defaults.
+    let old: Session = serde_json::from_str(
+        r#"{"id":"old","parent_id":null,"title":null,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","messages":[]}"#,
+    )?;
+    assert!(old.account_pins.is_empty());
+    assert_eq!(old.account_failover, None);
+    assert!(old.account_failover_home.is_empty());
+    Ok(())
 }

@@ -4,6 +4,8 @@
 //! crate plus a binary relink instead of rebuilding the base -> app-core ->
 //! tui spine. The binary's composition root registers a parameterized factory
 //! with `jcode_base::provider::external::register_openrouter_factory`.
+// Tests hold the std env/home serialization lock across awaits on purpose.
+#![cfg_attr(test, allow(clippy::await_holding_lock))]
 
 //! OpenRouter API provider
 //!
@@ -461,6 +463,30 @@ fn apply_opencode_session_header(
 
 pub(crate) const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
 
+/// Models the Grok CLI chat proxy serves to Grok Build subscribers.
+pub const GROK_BUILD_MODELS: &[&str] = &["grok-4.6", "grok-4.5", "grok-code-fast-1"];
+const GROK_BUILD_AUTH_LABEL: &str = "Grok Build subscription (Grok CLI OIDC)";
+
+/// Per-turn Grok CLI sampler headers (model override, conversation/request ids).
+fn apply_grok_cli_turn_headers(
+    mut req: reqwest::RequestBuilder,
+    auth: &ProviderAuth,
+    model: &str,
+    conversation_id: &str,
+) -> reqwest::RequestBuilder {
+    if matches!(auth, ProviderAuth::GrokCli { .. }) {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        for (name, value) in jcode_base::auth::grok_build::chat_proxy_turn_headers(
+            model,
+            conversation_id,
+            &request_id,
+        ) {
+            req = req.header(name, value);
+        }
+    }
+    req
+}
+
 #[derive(Debug, Clone)]
 enum ProviderAuth {
     AuthorizationBearer {
@@ -473,6 +499,12 @@ enum ProviderAuth {
         label: String,
     },
     AzureEntra {
+        label: String,
+    },
+    /// Grok Build subscription: the Grok CLI OIDC session from
+    /// `~/.grok/auth.json`, resolved (and refreshed when expired) per request,
+    /// plus the Grok CLI identity headers the chat proxy requires.
+    GrokCli {
         label: String,
     },
     None {
@@ -491,6 +523,14 @@ impl ProviderAuth {
                 let token = jcode_base::auth::azure::get_bearer_token().await?;
                 Ok(req.bearer_auth(token))
             }
+            Self::GrokCli { .. } => {
+                let token = jcode_base::auth::grok_build::bearer_token(false).await?;
+                let mut req = req.bearer_auth(token);
+                for (name, value) in jcode_base::auth::grok_build::chat_proxy_identity_headers() {
+                    req = req.header(name, value);
+                }
+                Ok(req)
+            }
             Self::None { .. } => Ok(req),
         }
     }
@@ -500,6 +540,7 @@ impl ProviderAuth {
             Self::AuthorizationBearer { label, .. } => label,
             Self::HeaderValue { label, .. } => label,
             Self::AzureEntra { label } => label,
+            Self::GrokCli { label } => label,
             Self::None { label } => label,
         }
     }
@@ -920,6 +961,19 @@ pub struct OpenRouterProvider {
     /// Resolved once at construction from named-profile config or the
     /// `JCODE_OPENAI_EXTRA_BODY` env/env-file value.
     extra_body: Option<serde_json::Map<String, Value>>,
+    /// Kimi partial-mode thinking prefill seed, resolved once at construction
+    /// from named-profile config or the `JCODE_KIMI_THINKING_PREFILL`
+    /// env/env-file value. Sent only for Kimi-family models on non-strict
+    /// OpenAI-schema endpoints (appended in `complete()`).
+    thinking_prefill_seed: Option<String>,
+    /// Optional character-anchor `name` for the partial-mode prefill message,
+    /// resolved from named-profile config or `JCODE_KIMI_PREFILL_NAME`.
+    thinking_prefill_name: Option<String>,
+    /// Whether the profile's `thinking_prefill` should also be sent for
+    /// non-Kimi models (explicit opt-in via named-profile config), so gateways
+    /// that accept partial-mode prefills beyond Moonshot (e.g. GLM proxies)
+    /// can seed their thinking too.
+    thinking_prefill_non_kimi: bool,
     static_models: Vec<String>,
     static_context_limits: HashMap<String, usize>,
     /// Explicit per-model image-input capability from named-provider `models[].input`.
@@ -1281,6 +1335,41 @@ impl OpenRouterProvider {
         }
     }
 
+    /// Resolve the Kimi partial-mode thinking prefill for an
+    /// OpenAI-compatible/OpenRouter provider.
+    ///
+    /// Sources, in precedence order:
+    /// 1. Optional named-profile `thinking_prefill` / `prefill_name` config.
+    /// 2. The `JCODE_KIMI_THINKING_PREFILL` / `JCODE_KIMI_PREFILL_NAME` env
+    ///    vars (or the same keys inside the profile's `.env` file).
+    ///
+    /// Returns `(seed, name)`; both `None` when nothing is configured.
+    fn resolve_thinking_prefill(
+        seed_config: Option<&str>,
+        name_config: Option<&str>,
+        env_file: &str,
+    ) -> (Option<String>, Option<String>) {
+        let seed = seed_config
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                load_env_value_from_env_or_config("JCODE_KIMI_THINKING_PREFILL", env_file)
+                    .map(|raw| raw.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            });
+        let name = name_config
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                load_env_value_from_env_or_config("JCODE_KIMI_PREFILL_NAME", env_file)
+                    .map(|raw| raw.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            });
+        (seed, name)
+    }
+
     pub fn supports_provider_routing_features(&self) -> bool {
         self.supports_provider_features
     }
@@ -1474,6 +1563,15 @@ impl OpenRouterProvider {
                 ))
             })
             .collect::<HashMap<_, _>>();
+        let (thinking_prefill_seed, thinking_prefill_name) = Self::resolve_thinking_prefill(
+            profile.thinking_prefill.as_deref(),
+            profile.prefill_name.as_deref(),
+            profile
+                .env_file
+                .as_deref()
+                .filter(|name| is_safe_env_file_name(name))
+                .unwrap_or(DEFAULT_ENV_FILE),
+        );
         let provider = Self {
             client: jcode_provider_core::shared_http_client(),
             model: Arc::new(RwLock::new(model)),
@@ -1503,6 +1601,9 @@ impl OpenRouterProvider {
                     .filter(|name| is_safe_env_file_name(name))
                     .unwrap_or(DEFAULT_ENV_FILE),
             ),
+            thinking_prefill_seed,
+            thinking_prefill_name,
+            thinking_prefill_non_kimi: profile.thinking_prefill_non_kimi,
             static_models,
             static_context_limits,
             static_image_input_support,
@@ -1691,6 +1792,8 @@ impl OpenRouterProvider {
         };
         let max_tokens = Self::configured_max_tokens(profile_id.as_deref());
         let extra_body = Self::resolve_extra_body(None, &configured_env_file_name());
+        let (thinking_prefill_seed, thinking_prefill_name) =
+            Self::resolve_thinking_prefill(None, None, &configured_env_file_name());
 
         Ok(Self {
             client: jcode_provider_core::shared_http_client(),
@@ -1709,6 +1812,9 @@ impl OpenRouterProvider {
             static_reasoning_config: HashMap::new(),
             max_tokens,
             extra_body,
+            thinking_prefill_seed,
+            thinking_prefill_name,
+            thinking_prefill_non_kimi: false,
             static_models,
             static_context_limits,
             static_image_input_support: HashMap::new(),
@@ -1721,6 +1827,63 @@ impl OpenRouterProvider {
             endpoints_cache: Arc::new(RwLock::new(HashMap::new())),
             endpoint_refresh: Arc::new(Mutex::new(EndpointRefreshTracker::default())),
         })
+    }
+
+    /// Grok Build subscription over the Grok CLI chat proxy
+    /// (`https://cli-chat-proxy.grok.com/v1`, OpenAI-compatible).
+    ///
+    /// Auth is the Grok CLI OIDC session, not `XAI_API_KEY`. The token is read
+    /// from `auth.json` for every request so refreshes (by Jcode or the Grok
+    /// CLI) are picked up without rebuilding the provider. Jcode owns tools.
+    pub fn new_grok_build_subscription(model: &str) -> Self {
+        let static_models = GROK_BUILD_MODELS
+            .iter()
+            .map(|model| model.to_string())
+            .collect::<Vec<_>>();
+        let static_context_limits = GROK_BUILD_MODELS
+            .iter()
+            .map(|model| {
+                let limit = if model.contains("grok-code-fast") {
+                    256_000
+                } else {
+                    500_000
+                };
+                (model.to_string(), limit)
+            })
+            .collect();
+        Self {
+            client: jcode_provider_core::shared_http_client(),
+            model: Arc::new(RwLock::new(model.to_string())),
+            reasoning_effort: Arc::new(RwLock::new(None)),
+            api_base: jcode_base::auth::grok_build::chat_proxy_base_url(),
+            auth: ProviderAuth::GrokCli {
+                label: GROK_BUILD_AUTH_LABEL.to_string(),
+            },
+            supports_provider_features: false,
+            // The proxy's `/models` shape is not a documented catalog; keep the
+            // curated list so `/model` works offline and before first request.
+            supports_model_catalog: false,
+            profile_id: Some("grok-build".to_string()),
+            reasoning_effort_support: Some(false),
+            disable_reasoning_heuristics: true,
+            static_reasoning_config: HashMap::new(),
+            max_tokens: Self::configured_max_tokens(None),
+            extra_body: None,
+            thinking_prefill_seed: None,
+            thinking_prefill_name: None,
+            thinking_prefill_non_kimi: false,
+            static_models,
+            static_context_limits,
+            static_image_input_support: HashMap::new(),
+            send_openrouter_headers: false,
+            conversation_id: new_conversation_id(),
+            models_cache: Arc::new(RwLock::new(ModelsCache::default())),
+            model_catalog_refresh: Arc::new(Mutex::new(ModelCatalogRefreshState::default())),
+            provider_routing: Arc::new(RwLock::new(ProviderRouting::default())),
+            provider_pin: Arc::new(Mutex::new(None)),
+            endpoints_cache: Arc::new(RwLock::new(HashMap::new())),
+            endpoint_refresh: Arc::new(Mutex::new(EndpointRefreshTracker::default())),
+        }
     }
 
     pub fn new_openrouter_api_key_runtime() -> Result<Self> {
@@ -1753,6 +1916,9 @@ impl OpenRouterProvider {
             static_reasoning_config: HashMap::new(),
             max_tokens: Self::configured_max_tokens(None),
             extra_body: Self::resolve_extra_body(None, DEFAULT_ENV_FILE),
+            thinking_prefill_seed: Self::resolve_thinking_prefill(None, None, DEFAULT_ENV_FILE).0,
+            thinking_prefill_name: Self::resolve_thinking_prefill(None, None, DEFAULT_ENV_FILE).1,
+            thinking_prefill_non_kimi: false,
             static_models: Vec::new(),
             static_context_limits: HashMap::new(),
             static_image_input_support: HashMap::new(),
@@ -1825,6 +1991,9 @@ impl OpenRouterProvider {
             static_reasoning_config: HashMap::new(),
             max_tokens: Self::configured_max_tokens(Some(&resolved.id)),
             extra_body: Self::resolve_extra_body(None, &resolved.env_file),
+            thinking_prefill_seed: Self::resolve_thinking_prefill(None, None, &resolved.env_file).0,
+            thinking_prefill_name: Self::resolve_thinking_prefill(None, None, &resolved.env_file).1,
+            thinking_prefill_non_kimi: false,
             static_models,
             static_context_limits,
             static_image_input_support: HashMap::new(),
@@ -2031,6 +2200,9 @@ impl OpenRouterProvider {
                 static_reasoning_config: HashMap::new(),
                 max_tokens: None,
                 extra_body: None,
+                thinking_prefill_seed: None,
+                thinking_prefill_name: None,
+                thinking_prefill_non_kimi: false,
                 static_models: Vec::new(),
                 static_context_limits: HashMap::new(),
                 static_image_input_support: HashMap::new(),
@@ -2837,6 +3009,10 @@ mod openrouter_catalog_merge_tests;
 #[cfg(test)]
 #[path = "openrouter_pricing_deadlock_tests.rs"]
 mod openrouter_pricing_deadlock_tests;
+
+#[cfg(test)]
+#[path = "openrouter_input_modalities_tests.rs"]
+mod openrouter_input_modalities_tests;
 
 #[cfg(test)]
 #[path = "issue_1056_tests.rs"]

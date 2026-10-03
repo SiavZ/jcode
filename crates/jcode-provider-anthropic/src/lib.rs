@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 /// Claude Code billing attribution text observed in the official CLI's system
 /// prompt blocks.
-pub const OAUTH_BILLING_HEADER: &str = "cc_version=2.1.257; cc_entrypoint=sdk-cli; cch=33f85;";
+pub const OAUTH_BILLING_HEADER: &str = "cc_version=2.1.280; cc_entrypoint=sdk-cli; cch=33f85;";
 
 const CLAUDE_CODE_IDENTITY: &str = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 
@@ -16,8 +16,40 @@ const CLAUDE_CODE_IDENTITY: &str = "You are a Claude agent, built on Anthropic's
 pub(crate) const CONTINUATION_USER_TURN: &str = "Continue.";
 
 pub fn format_messages(messages: &[Message], is_oauth: bool) -> Vec<ApiMessage> {
-    use std::collections::HashSet;
+    format_messages_with_tools(messages, is_oauth, &[])
+}
 
+/// Like [`format_messages`], rendering `ContentBlock::ToolReference` blocks as
+/// native `tool_reference` blocks for tools present in `api_tools`.
+///
+/// A reference to a tool missing from the request's `tools` array is a hard
+/// 400, so references to tools that are no longer available (server
+/// disconnected, session resumed elsewhere) are dropped and the tool result
+/// keeps its plain text.
+pub fn format_messages_with_tools(
+    messages: &[Message],
+    is_oauth: bool,
+    api_tools: &[ApiTool],
+) -> Vec<ApiMessage> {
+    format_messages_with_native(messages, is_oauth, api_tools, false)
+}
+
+/// Like [`format_messages_with_tools`], additionally controlling how stored
+/// provider-native blocks ([`ContentBlock::ProviderNative`]) are sent.
+///
+/// With `native_replay`, Anthropic server tool blocks (`server_tool_use`,
+/// `web_search_tool_result`) are replayed verbatim, which the API requires for
+/// their encrypted payloads. Without it (the server tool is not attached to this
+/// request, or the block came from another provider) they are downgraded to a
+/// plain-text summary so the conversation stays valid.
+pub fn format_messages_with_native(
+    messages: &[Message],
+    is_oauth: bool,
+    api_tools: &[ApiTool],
+    native_replay: bool,
+) -> Vec<ApiMessage> {
+    use std::collections::HashSet;
+    let available: HashSet<&str> = api_tools.iter().map(|tool| tool.name.as_str()).collect();
     // Pre-pass: drop duplicate tool_results for the same tool_use_id.
     //
     // Anthropic rejects the whole request (400 "unexpected `tool_use_id` found
@@ -29,6 +61,13 @@ pub fn format_messages(messages: &[Message], is_oauth: bool) -> Vec<ApiMessage> 
     // and the conversation is permanently unsendable. Prefer the real output
     // over the synthetic placeholder, and otherwise keep the first occurrence.
     let messages = &dedupe_tool_results(messages);
+    // Anthropic requires every tool_use to be answered in the very next
+    // message. A tool whose result was persisted later (after another turn was
+    // written in between, e.g. a reload or a scheduled-task wake-up while tools
+    // were still running) leaves the call unanswered where it matters and its
+    // result stranded later on, and the request 400s permanently. Move such
+    // results up to directly follow their call.
+    let messages = &hoist_late_tool_results(messages);
 
     // First pass: collect all tool_use IDs and tool_result IDs
     let mut tool_use_ids: HashSet<String> = HashSet::new();
@@ -67,7 +106,8 @@ pub fn format_messages(messages: &[Message], is_oauth: bool) -> Vec<ApiMessage> 
             Role::Assistant => "assistant",
         };
 
-        let content = format_content_blocks(&msg.content, is_oauth);
+        let mut content = format_content_blocks_with_native(&msg.content, is_oauth, native_replay);
+        apply_tool_references(&mut content, &msg.content, is_oauth, &available);
 
         if !content.is_empty() {
             result.push(ApiMessage {
@@ -122,6 +162,33 @@ pub fn format_messages(messages: &[Message], is_oauth: bool) -> Vec<ApiMessage> 
         ));
     }
 
+    rewrite_orphaned_tool_results(&mut merged);
+
+    // Anthropic requires every tool_result answering the previous assistant
+    // turn to lead the user message. Merging separate tool-result messages can
+    // interleave sibling text (for example text moved out of a tool_result by
+    // `apply_tool_references` for parallel tool_search calls), which makes the
+    // API report later tool_use ids as missing their tool_result. Stable
+    // partition so tool_results come first and other blocks keep their order.
+    for msg in merged.iter_mut().filter(|m| m.role == "user") {
+        let first_non_result = msg
+            .content
+            .iter()
+            .position(|b| !matches!(b, ApiContentBlock::ToolResult { .. }));
+        let needs_reorder = first_non_result.is_some_and(|start| {
+            msg.content[start..]
+                .iter()
+                .any(|b| matches!(b, ApiContentBlock::ToolResult { .. }))
+        });
+        if needs_reorder {
+            let (results, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut msg.content)
+                .into_iter()
+                .partition(|b| matches!(b, ApiContentBlock::ToolResult { .. }));
+            msg.content = results;
+            msg.content.extend(rest);
+        }
+    }
+
     // Anthropic rejects a request whose final message is an assistant turn on
     // models that do not support assistant prefill ("This model does not support
     // assistant message prefill. The conversation must end with a user message.").
@@ -130,7 +197,14 @@ pub fn format_messages(messages: &[Message], is_oauth: bool) -> Vec<ApiMessage> 
     // user content and delivers its continuation as a system reminder, leaving the
     // transcript ending on the interrupted assistant turn. Repair the shape at the
     // last formatting step. See issue #600.
-    if merged.last().is_some_and(|last| last.role == "assistant") {
+    //
+    // Exception: a turn that stopped with `pause_turn` mid server-tool use must
+    // be resent exactly as-is so the API can resume it. Those turns end on an
+    // assistant message carrying raw server tool blocks.
+    if merged
+        .last()
+        .is_some_and(|last| last.role == "assistant" && !is_paused_server_tool_turn(last))
+    {
         jcode_logging::warn(
             "[anthropic] Conversation ended with an assistant message; appending a \
              continuation user turn to avoid a model prefill rejection (400)",
@@ -202,6 +276,324 @@ pub fn format_messages(messages: &[Message], is_oauth: bool) -> Vec<ApiMessage> 
     }
 
     merged
+}
+
+/// Move each `tool_result` that is not in the message directly after its
+/// `tool_use` up into a user message placed directly after the assistant
+/// message that made the call. Results already in the right place are left
+/// alone. Runs after dedupe, so each id has at most one result.
+fn hoist_late_tool_results(messages: &[Message]) -> Vec<Message> {
+    use std::collections::{HashMap, HashSet};
+
+    // Assistant message index that made each call.
+    let mut call_at: HashMap<&str, usize> = HashMap::new();
+    for (mi, msg) in messages.iter().enumerate() {
+        if matches!(msg.role, Role::Assistant) {
+            for block in &msg.content {
+                if let ContentBlock::ToolUse { id, .. } = block {
+                    call_at.insert(id, mi);
+                }
+            }
+        }
+    }
+
+    // Results that are not in the message right after their call. Consecutive
+    // messages of one role are merged into one later, so compare "turn"
+    // positions: parallel calls stored as one user message per result, and
+    // back-to-back assistant messages, each collapse into a single turn.
+    let turn: Vec<usize> = {
+        let mut t = 0usize;
+        let mut prev: Option<bool> = None;
+        messages
+            .iter()
+            .map(|m| {
+                let is_user = matches!(m.role, Role::User);
+                if prev.is_some_and(|p| p != is_user) {
+                    t += 1;
+                }
+                prev = Some(is_user);
+                t
+            })
+            .collect()
+    };
+    let mut late: HashSet<(usize, usize)> = HashSet::new();
+    let mut moved: HashMap<usize, Vec<ContentBlock>> = HashMap::new();
+    for (mi, msg) in messages.iter().enumerate() {
+        for (bi, block) in msg.content.iter().enumerate() {
+            let ContentBlock::ToolResult { tool_use_id, .. } = block else {
+                continue;
+            };
+            let Some(&call) = call_at.get(tool_use_id.as_str()) else {
+                continue; // no call anywhere: left to the orphan rewrite
+            };
+            let in_place = turn[mi] == turn[call] + 1;
+            if !in_place {
+                // Insert after the last message of the call's turn, so a run
+                // of assistant messages stays one turn.
+                let anchor = (call..messages.len())
+                    .take_while(|&i| turn[i] == turn[call])
+                    .last()
+                    .unwrap_or(call);
+                let dest = moved.entry(anchor).or_default();
+                for j in std::iter::once(bi).chain(attached_to_result(&msg.content, bi)) {
+                    late.insert((mi, j));
+                    dest.push(msg.content[j].clone());
+                }
+            }
+        }
+    }
+    if late.is_empty() {
+        return messages.to_vec();
+    }
+    jcode_logging::warn(&format!(
+        "[anthropic] Moved {} late tool_result block(s) up to directly follow their tool_use",
+        late.len()
+    ));
+
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len() + moved.len());
+    for (mi, msg) in messages.iter().enumerate() {
+        let content: Vec<ContentBlock> = msg
+            .content
+            .iter()
+            .enumerate()
+            .filter(|(bi, _)| !late.contains(&(mi, *bi)))
+            .map(|(_, b)| b.clone())
+            .collect();
+        if !content.is_empty() {
+            out.push(Message {
+                content,
+                ..msg.clone()
+            });
+        }
+        if let Some(results) = moved.remove(&mi) {
+            // Same-role merging later folds this into the next user message
+            // when there is one, keeping the results first.
+            out.push(Message {
+                role: Role::User,
+                content: results,
+                timestamp: msg.timestamp,
+                tool_duration_ms: None,
+            });
+        }
+    }
+    out
+}
+
+/// Indices of the blocks that belong to the tool_result at `result_idx`, in
+/// order. A tool output is stored as the result followed by its images, each
+/// optionally followed by an "[Attached image ...]" label, so those travel
+/// with the result when it moves.
+fn attached_to_result(blocks: &[ContentBlock], result_idx: usize) -> Vec<usize> {
+    const IMAGE_LABEL_PREFIX: &str = "[Attached image associated with the preceding tool result:";
+    if !matches!(blocks[result_idx], ContentBlock::ToolResult { .. }) {
+        return Vec::new();
+    }
+    let mut attached = Vec::new();
+    let mut after_image = false;
+    let mut end = result_idx + 1;
+    while let Some(block) = blocks.get(end) {
+        let belongs = match block {
+            ContentBlock::Image { .. } => true,
+            ContentBlock::Text { text, .. } => after_image && text.starts_with(IMAGE_LABEL_PREFIX),
+            _ => false,
+        };
+        if !belongs {
+            break;
+        }
+        after_image = matches!(block, ContentBlock::Image { .. });
+        attached.push(end);
+        end += 1;
+    }
+    attached
+}
+
+/// Rewrite any `tool_result` whose `tool_use_id` is not answered by a `tool_use`
+/// in the immediately preceding assistant message into a plain text block.
+///
+/// Anthropic rejects the whole request (400 "unexpected `tool_use_id` found in
+/// `tool_result` blocks") when a result is not paired with the previous
+/// message. This happens when a late tool result is persisted after the
+/// interrupt repair already answered the call and a new assistant turn was
+/// written, leaving the result stranded after an unrelated message. Keeping the
+/// output as text preserves the information while making the history sendable.
+fn rewrite_orphaned_tool_results(messages: &mut [ApiMessage]) {
+    use std::collections::HashSet;
+
+    let mut rewritten = 0usize;
+    for i in 0..messages.len() {
+        if messages[i].role != "user" {
+            continue;
+        }
+        let expected: HashSet<String> = if i > 0 && messages[i - 1].role == "assistant" {
+            messages[i - 1]
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ApiContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            HashSet::new()
+        };
+
+        let has_orphan = messages[i].content.iter().any(|b| {
+            matches!(b, ApiContentBlock::ToolResult { tool_use_id, .. } if !expected.contains(tool_use_id))
+        });
+        if !has_orphan {
+            continue;
+        }
+
+        let mut paired: Vec<ApiContentBlock> = Vec::new();
+        let mut other: Vec<ApiContentBlock> = Vec::new();
+        for block in std::mem::take(&mut messages[i].content) {
+            match block {
+                ApiContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } if !expected.contains(&tool_use_id) => {
+                    rewritten += 1;
+                    let label = if is_error {
+                        "Recovered orphaned tool error"
+                    } else {
+                        "Recovered orphaned tool output"
+                    };
+                    match content {
+                        ToolResultContent::Text(text) => other.push(ApiContentBlock::Text {
+                            text: format!("[{label}: {tool_use_id}]\n{text}"),
+                            cache_control: None,
+                        }),
+                        ToolResultContent::Blocks(blocks) => {
+                            other.push(ApiContentBlock::Text {
+                                text: format!("[{label}: {tool_use_id}]"),
+                                cache_control: None,
+                            });
+                            for b in blocks {
+                                other.push(match b {
+                                    ToolResultContentBlock::Text { text } => {
+                                        ApiContentBlock::Text {
+                                            text,
+                                            cache_control: None,
+                                        }
+                                    }
+                                    ToolResultContentBlock::Image { source } => {
+                                        ApiContentBlock::Image { source }
+                                    }
+                                    // A tool_reference is only valid inside a
+                                    // tool_result, so keep it as a text note.
+                                    ToolResultContentBlock::ToolReference { tool_name } => {
+                                        ApiContentBlock::Text {
+                                            text: format!("[Tool reference: {tool_name}]"),
+                                            cache_control: None,
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+                b @ ApiContentBlock::ToolResult { .. } => paired.push(b),
+                b => other.push(b),
+            }
+        }
+        // Paired tool_results must lead the user turn.
+        paired.extend(other);
+        messages[i].content = paired;
+    }
+
+    if rewritten > 0 {
+        jcode_logging::warn(&format!(
+            "[anthropic] Rewrote {rewritten} orphaned tool_result(s) as text to prevent a 400"
+        ));
+    }
+}
+
+/// Fold `ContentBlock::ToolReference` blocks into their tool_result.
+///
+/// The API rejects a tool_result that mixes `tool_reference` blocks with any
+/// other content, so the referencing tool_result carries only references; its
+/// original text moves to a sibling text block right after the tool_results,
+/// keeping them contiguous. Only references to tools in this request's
+/// catalog are emitted.
+fn apply_tool_references(
+    content: &mut Vec<ApiContentBlock>,
+    blocks: &[ContentBlock],
+    is_oauth: bool,
+    available: &std::collections::HashSet<&str>,
+) {
+    use std::collections::HashMap;
+    let mut refs: HashMap<String, Vec<String>> = HashMap::new();
+    for block in blocks {
+        if let ContentBlock::ToolReference {
+            tool_use_id,
+            tool_name,
+        } = block
+        {
+            let name = if is_oauth {
+                map_tool_name_for_oauth(tool_name)
+            } else {
+                tool_name.clone()
+            };
+            if !available.contains(name.as_str()) {
+                continue;
+            }
+            let entry = refs.entry(sanitize_tool_id(tool_use_id)).or_default();
+            if !entry.contains(&name) {
+                entry.push(name);
+            }
+        }
+    }
+    if refs.is_empty() {
+        return;
+    }
+    let mut moved_text: Vec<ApiContentBlock> = Vec::new();
+    for block in content.iter_mut() {
+        let ApiContentBlock::ToolResult {
+            tool_use_id,
+            content: result_content,
+            ..
+        } = block
+        else {
+            continue;
+        };
+        let Some(names) = refs.remove(tool_use_id.as_str()) else {
+            continue;
+        };
+        let previous = std::mem::replace(
+            result_content,
+            ToolResultContent::Blocks(
+                names
+                    .into_iter()
+                    .map(|tool_name| ToolResultContentBlock::ToolReference { tool_name })
+                    .collect(),
+            ),
+        );
+        let texts: Vec<String> = match previous {
+            ToolResultContent::Text(text) => vec![text],
+            ToolResultContent::Blocks(blocks) => blocks
+                .into_iter()
+                .filter_map(|b| match b {
+                    ToolResultContentBlock::Text { text } => Some(text),
+                    _ => None,
+                })
+                .collect(),
+        };
+        for text in texts.into_iter().filter(|t| !t.trim().is_empty()) {
+            moved_text.push(ApiContentBlock::Text {
+                text,
+                cache_control: None,
+            });
+        }
+    }
+    if moved_text.is_empty() {
+        return;
+    }
+    let insert_at = content
+        .iter()
+        .rposition(|b| matches!(b, ApiContentBlock::ToolResult { .. }))
+        .map_or(0, |i| i + 1);
+    content.splice(insert_at..insert_at, moved_text);
 }
 
 /// Returns true when a tool_result body is one of the synthetic placeholders
@@ -291,9 +683,60 @@ fn dedupe_tool_results(messages: &[Message]) -> Vec<Message> {
 
 /// Convert our ContentBlock to Anthropic API format
 pub fn format_content_blocks(blocks: &[ContentBlock], is_oauth: bool) -> Vec<ApiContentBlock> {
+    format_content_blocks_with_native(blocks, is_oauth, false)
+}
+
+/// True when an assistant message ends on a raw server tool block, i.e. the
+/// shape of a provider-native turn paused with `pause_turn`. Anthropic resumes
+/// such a turn when it is resent as-is. A turn that searched and then went on to
+/// produce text (e.g. interrupted mid-answer) ends on that text instead, and
+/// still needs the continuation user turn to avoid a prefill rejection.
+fn is_paused_server_tool_turn(message: &ApiMessage) -> bool {
+    matches!(message.content.last(), Some(ApiContentBlock::Raw(_)))
+}
+
+/// See [`format_messages_with_native`] for the meaning of `native_replay`.
+pub fn format_content_blocks_with_native(
+    blocks: &[ContentBlock],
+    is_oauth: bool,
+    native_replay: bool,
+) -> Vec<ApiContentBlock> {
     let mut result: Vec<ApiContentBlock> = Vec::new();
+    // Inputs of server tool calls seen so far, so a downgraded result can name
+    // the query that produced it.
+    let mut native_call_inputs: std::collections::HashMap<String, Value> =
+        std::collections::HashMap::new();
     for block in blocks {
         match block {
+            ContentBlock::ProviderNative { provider, item } => {
+                use jcode_message_types::provider_native;
+                let display = provider_native::provider_native_display(provider, item);
+                if let Some(display) = &display
+                    && display.output.is_none()
+                    && let Some(input) = &display.input
+                {
+                    native_call_inputs.insert(display.id.clone(), input.clone());
+                }
+                let is_anthropic_block = provider == provider_native::PROVIDER_NATIVE_ANTHROPIC
+                    && item
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(provider_native::is_anthropic_server_tool_block);
+                if native_replay && is_anthropic_block {
+                    result.push(ApiContentBlock::Raw(item.clone()));
+                } else if let Some(text) = provider_native::provider_native_text_fallback(
+                    provider,
+                    item,
+                    display
+                        .as_ref()
+                        .and_then(|display| native_call_inputs.get(&display.id)),
+                ) {
+                    result.push(ApiContentBlock::Text {
+                        text,
+                        cache_control: None,
+                    });
+                }
+            }
             ContentBlock::Text { text, .. } => {
                 // A text block that immediately follows an image-bearing tool_result is the
                 // "[Attached image associated with the preceding tool result: ...]" label
@@ -458,6 +901,7 @@ pub fn format_tools(tools: &[ToolDefinition], is_oauth: bool, cache_ttl_1h: bool
                         .to_string(),
                     input_schema: json!({"type":"object","properties":{"description":{"type":"string"},"prompt":{"type":"string"},"subagent_type":{"type":"string"},"run_in_background":{"type":"boolean"}},"required":["description","prompt"],"additionalProperties":false}),
                     cache_control: None,
+                    defer_loading: false,
                 },
             ),
             (
@@ -467,6 +911,7 @@ pub fn format_tools(tools: &[ToolDefinition], is_oauth: bool, cache_ttl_1h: bool
                     description: "Performs exact string replacements in files.".to_string(),
                     input_schema: json!({"type":"object","properties":{"file_path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean","default":false}},"required":["file_path","old_string","new_string"],"additionalProperties":false}),
                     cache_control: None,
+                    defer_loading: false,
                 },
             ),
             (
@@ -476,6 +921,7 @@ pub fn format_tools(tools: &[ToolDefinition], is_oauth: bool, cache_ttl_1h: bool
                     description: "Fast file pattern matching tool.".to_string(),
                     input_schema: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"],"additionalProperties":false}),
                     cache_control: None,
+                    defer_loading: false,
                 },
             ),
             (
@@ -485,6 +931,7 @@ pub fn format_tools(tools: &[ToolDefinition], is_oauth: bool, cache_ttl_1h: bool
                     description: "A powerful search tool built on ripgrep.".to_string(),
                     input_schema: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"output_mode":{"type":"string","enum":["content","files_with_matches","count"]},"-B":{"type":"number"},"-A":{"type":"number"},"-C":{"type":"number"},"context":{"type":"number"},"-n":{"type":"boolean"},"-i":{"type":"boolean"},"type":{"type":"string"},"head_limit":{"type":"number"},"offset":{"type":"number"},"multiline":{"type":"boolean"}},"required":["pattern"],"additionalProperties":false}),
                     cache_control: None,
+                    defer_loading: false,
                 },
             ),
             (
@@ -494,6 +941,7 @@ pub fn format_tools(tools: &[ToolDefinition], is_oauth: bool, cache_ttl_1h: bool
                     description: "Reads a file from the local filesystem.".to_string(),
                     input_schema: json!({"type":"object","properties":{"file_path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","exclusiveMinimum":0},"pages":{"type":"string"}},"required":["file_path"],"additionalProperties":false}),
                     cache_control: None,
+                    defer_loading: false,
                 },
             ),
             (
@@ -503,6 +951,7 @@ pub fn format_tools(tools: &[ToolDefinition], is_oauth: bool, cache_ttl_1h: bool
                     description: "Execute a skill within the main conversation".to_string(),
                     input_schema: json!({"type":"object","properties":{"skill":{"type":"string"},"args":{"type":"string"}},"required":["skill"],"additionalProperties":false}),
                     cache_control: None,
+                    defer_loading: false,
                 },
             ),
             (
@@ -512,6 +961,7 @@ pub fn format_tools(tools: &[ToolDefinition], is_oauth: bool, cache_ttl_1h: bool
                     description: "Writes a file to the local filesystem.".to_string(),
                     input_schema: json!({"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}},"required":["file_path","content"],"additionalProperties":false}),
                     cache_control: None,
+                    defer_loading: false,
                 },
             ),
         ];
@@ -524,8 +974,7 @@ pub fn format_tools(tools: &[ToolDefinition], is_oauth: bool, cache_ttl_1h: bool
         // Forward every other registered tool, remapping its name to the
         // OAuth-accepted form. This restores websearch/webfetch/browser/
         // codesearch/memory/swarm/multiedit/open/etc. for subscription users,
-        // matching the documented "remap names, keep the full toolset" behavior
-        // and the (deprecated) Claude CLI transport.
+        // matching the documented "remap names, keep the full toolset" behavior.
         for tool in tools {
             if OAUTH_BUILTIN_LOCAL_TOOLS.contains(&tool.name.as_str()) {
                 continue;
@@ -535,32 +984,48 @@ pub fn format_tools(tools: &[ToolDefinition], is_oauth: bool, cache_ttl_1h: bool
                 description: tool.description.clone(),
                 input_schema: anthropic_input_schema(&tool.input_schema),
                 cache_control: None,
+                defer_loading: tool.defer_loading,
             });
         }
 
-        // Move the prompt-cache breakpoint to the final tool in the list.
-        if let Some(last) = out.last_mut() {
-            last.cache_control = Some(CacheControlParam::ephemeral(cache_ttl_1h));
-        }
-
-        return out;
+        return finish_tool_list(out, cache_ttl_1h);
     }
 
-    let len = tools.len();
-    tools
+    let out = tools
         .iter()
-        .enumerate()
-        .map(|(i, tool)| ApiTool {
+        .map(|tool| ApiTool {
             name: tool.name.clone(),
             description: tool.description.clone(),
             input_schema: anthropic_input_schema(&tool.input_schema),
-            cache_control: if i == len - 1 {
-                Some(CacheControlParam::ephemeral(cache_ttl_1h))
-            } else {
-                None
-            },
+            cache_control: None,
+            defer_loading: tool.defer_loading,
         })
-        .collect()
+        .collect();
+    finish_tool_list(out, cache_ttl_1h)
+}
+
+/// Order eager tools before deferred ones and put the prompt-cache breakpoint
+/// on the last eager tool.
+///
+/// Deferred tools stay out of the cached system-prompt prefix, so they must
+/// neither carry `cache_control` (the API rejects that with a 400) nor sit
+/// between cached tools, where adding or removing one would shift the prefix.
+/// The API also requires at least one non-deferred tool, so a list of only
+/// deferred tools is sent eagerly instead.
+fn finish_tool_list(tools: Vec<ApiTool>, cache_ttl_1h: bool) -> Vec<ApiTool> {
+    let (mut out, mut deferred): (Vec<ApiTool>, Vec<ApiTool>) =
+        tools.into_iter().partition(|tool| !tool.defer_loading);
+    if out.is_empty() {
+        for tool in &mut deferred {
+            tool.defer_loading = false;
+        }
+        std::mem::swap(&mut out, &mut deferred);
+    }
+    if let Some(last) = out.last_mut() {
+        last.cache_control = Some(CacheControlParam::ephemeral(cache_ttl_1h));
+    }
+    out.extend(deferred);
+    out
 }
 
 #[derive(Serialize, Clone)]
@@ -571,7 +1036,7 @@ pub struct ApiRequest {
     pub system: Option<ApiSystem>,
     pub messages: Vec<ApiMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<ApiTool>>,
+    pub tools: Option<Vec<ApiToolParam>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ApiMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -591,10 +1056,19 @@ pub enum ApiThinking {
     Adaptive {
         #[serde(skip_serializing_if = "Option::is_none")]
         display: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        block_binding: Option<ApiThinkingBlockBinding>,
     },
     Enabled {
         budget_tokens: u32,
     },
+}
+
+/// Permit the API to discard stale signed reasoning after compaction or a
+/// changed system prompt/tool schema instead of rejecting the whole request.
+#[derive(Serialize, Clone)]
+pub struct ApiThinkingBlockBinding {
+    pub prefix_mismatch_behavior: &'static str,
 }
 
 #[derive(Serialize, Clone)]
@@ -843,6 +1317,11 @@ pub enum ApiContentBlock {
     Thinking { thinking: String, signature: String },
     #[serde(rename = "image")]
     Image { source: ApiImageSource },
+    /// Provider-native block sent back exactly as the API produced it
+    /// (`server_tool_use`, `web_search_tool_result`). Its own `type` field is
+    /// kept, and its encrypted payloads must not be touched.
+    #[serde(untagged)]
+    Raw(Value),
 }
 
 #[derive(Serialize, Clone)]
@@ -859,6 +1338,10 @@ pub enum ToolResultContentBlock {
     Text { text: String },
     #[serde(rename = "image")]
     Image { source: ApiImageSource },
+    /// Loads a deferred tool definition (`defer_loading: true`) into context.
+    /// The API rejects a tool_result mixing references with other content.
+    #[serde(rename = "tool_reference")]
+    ToolReference { tool_name: String },
 }
 
 #[derive(Serialize, Clone)]
@@ -876,6 +1359,30 @@ pub struct ApiTool {
     pub input_schema: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControlParam>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub defer_loading: bool,
+}
+
+/// One entry of the request `tools` array: a client tool jcode executes, or an
+/// Anthropic server tool (e.g. `web_search_20250305`) the API executes itself.
+#[derive(Serialize, Clone)]
+#[serde(untagged)]
+pub enum ApiToolParam {
+    Custom(ApiTool),
+    Server(Value),
+}
+
+/// Build the request `tools` array. Server tools go right after the eager client
+/// tools (behind the tool-cache breakpoint) and before any deferred tools, so
+/// loading or unloading deferred tools never shifts them. Returns `None` when
+/// there are no tools at all.
+pub fn request_tools(custom: Vec<ApiTool>, server: Vec<Value>) -> Option<Vec<ApiToolParam>> {
+    let (eager, deferred): (Vec<ApiTool>, Vec<ApiTool>) =
+        custom.into_iter().partition(|tool| !tool.defer_loading);
+    let mut out: Vec<ApiToolParam> = eager.into_iter().map(ApiToolParam::Custom).collect();
+    out.extend(server.into_iter().map(ApiToolParam::Server));
+    out.extend(deferred.into_iter().map(ApiToolParam::Custom));
+    (!out.is_empty()).then_some(out)
 }
 
 #[cfg(test)]
@@ -1040,6 +1547,7 @@ mod cache_prefix_invariant_tests {
             name: name.to_string(),
             description: format!("{name} description"),
             input_schema: json!({"type":"object","properties":{}}),
+            defer_loading: false,
         }
     }
 
@@ -1065,6 +1573,7 @@ mod cache_prefix_invariant_tests {
                     {"type": "object", "properties": {"intent": {"type": "string"}}, "required": ["intent"]}
                 ]
             }),
+            defer_loading: false,
         };
 
         let formatted = format_tools(&[tool], false, false);
@@ -1187,3 +1696,7 @@ mod duplicate_tool_result_tests;
 #[cfg(test)]
 #[path = "wedge_fixture_check.rs"]
 mod wedge_fixture_check;
+
+#[cfg(test)]
+#[path = "deferred_tools_tests.rs"]
+mod deferred_tools_tests;

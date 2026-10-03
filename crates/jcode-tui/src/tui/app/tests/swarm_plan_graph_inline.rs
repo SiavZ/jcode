@@ -539,6 +539,7 @@ fn history_event_for_session(session_id: &str) -> crate::protocol::ServerEvent {
         provider_name: Some("claude".to_string()),
         provider_model: Some("claude-sonnet-4-20250514".to_string()),
         subagent_model: None,
+        agent_model_overrides: Default::default(),
         autoreview_enabled: None,
         autojudge_enabled: None,
         available_models: vec![],
@@ -562,6 +563,7 @@ fn history_event_for_session(session_id: &str) -> crate::protocol::ServerEvent {
         resolved_credential: None,
         reasoning_effort: None,
         service_tier: None,
+        account_labels: Vec::new(),
         compaction_mode: crate::config::CompactionMode::Reactive,
         activity: None,
         side_panel: crate::side_panel::SidePanelSnapshot::default(),
@@ -1103,7 +1105,9 @@ fn test_local_clear_command_empties_margin_info_widget_diagram_list() {
     assert!(super::commands::handle_session_command(&mut app, "/clear"));
 
     assert!(
-        crate::tui::TuiState::info_widget_data(&app).diagrams.is_empty(),
+        crate::tui::TuiState::info_widget_data(&app)
+            .diagrams
+            .is_empty(),
         "FIX: after local /clear the Margin info widget lists no diagram \
          from the discarded transcript"
     );

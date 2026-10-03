@@ -255,7 +255,10 @@ impl App {
             crate::logging::info(&format!("MCP: Found {} server(s) in config", server_count));
 
             let (successes, failures) = {
-                let manager = self.mcp_manager.write().await;
+                // `connect_all` uses the manager's internal locks. Keep only a
+                // read guard here so MCP management reads are not blocked by a
+                // slow initialize handshake.
+                let manager = self.mcp_manager.read().await;
                 let result = manager.connect_all().await.unwrap_or((0, Vec::new()));
                 // Cache server names with tool counts
                 let servers = manager.connected_servers().await;
@@ -366,6 +369,9 @@ impl App {
             if restored_model || self.session.model.is_none() {
                 self.session.model = Some(active_model.clone());
             }
+            // Per-window accounts and the failover toggle live on the
+            // session, but only the provider acts on them.
+            self.restore_local_window_accounts();
             self.update_context_limit_for_model(&active_model);
             // Mark session as active now that it's being used again
             self.session.mark_active();

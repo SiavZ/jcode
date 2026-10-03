@@ -485,7 +485,10 @@ impl App {
                     cache_read_tokens: None,
                     cache_write_tokens: None,
                     output_tps,
-                    available: usage.last_error.is_none(),
+                    // Before the first fetch lands, `get_sync` returns an
+                    // empty default (no error, 0% used). Showing that would
+                    // flash "100% left" for both limits, so wait for data.
+                    available: usage.last_error.is_none() && usage.fetched_at.is_some(),
                 })
             }
             WidgetProviderKind::OpenAI => {
@@ -676,24 +679,13 @@ impl crate::tui::TuiState for App {
         self.terminal_clear_collapsed()
     }
 
+    fn pending_resize_anchor(&self) -> Option<jcode_tui_messages::ContentPos> {
+        self.pending_resize_anchor.map(|pending| pending.target)
+    }
+
     fn pending_history_anchor_lines_from_bottom(&self) -> Option<usize> {
         self.pending_history_anchor
             .map(|anchor| anchor.lines_from_bottom)
-    }
-
-    fn chat_overscroll_active(&self) -> bool {
-        self.chat_overscroll_active()
-    }
-
-    fn chat_overscroll_pinned(&self) -> bool {
-        matches!(
-            self.overscroll_status_mode,
-            crate::config::OverscrollStatusMode::On
-        )
-    }
-
-    fn chat_overscroll_remaining(&self) -> Option<f32> {
-        self.chat_overscroll_remaining()
     }
 
     fn copy_selection_edge_autoscroll_active(&self) -> bool {
@@ -978,6 +970,10 @@ impl crate::tui::TuiState for App {
         self.remote_client_count
     }
 
+    fn voice_input_status(&self) -> Option<(bool, String)> {
+        self.voice_input_status_line()
+    }
+
     fn status_notice(&self) -> Option<String> {
         if !self.is_remote
             && self.provider.uses_jcode_compaction()
@@ -1031,6 +1027,10 @@ impl crate::tui::TuiState for App {
 
     fn dictation_key_label(&self) -> Option<String> {
         self.dictation_key_label().map(|s| s.to_string())
+    }
+
+    fn jump_to_bottom_key_label(&self) -> Option<String> {
+        self.scroll_keys.to_bottom_label()
     }
 
     fn animation_elapsed(&self) -> f32 {
@@ -1229,6 +1229,13 @@ impl crate::tui::TuiState for App {
                         }
                         ContentBlock::OpenAICompaction { encrypted_content } => {
                             user_chars += encrypted_content.len();
+                        }
+                        ContentBlock::ToolReference { tool_name, .. } => {
+                            user_chars += tool_name.len();
+                        }
+                        ContentBlock::ProviderNative { item, .. } => {
+                            tool_result_count += 1;
+                            tool_result_chars += item.to_string().len();
                         }
                     }
                 }
@@ -1549,6 +1556,7 @@ impl crate::tui::TuiState for App {
         let route = self.widget_route_info(model.as_deref());
         let auth_method = self.widget_auth_method(route);
         let usage_info = self.widget_usage_info(route, auth_method);
+        let window_account = self.widget_window_account(auth_method);
 
         let tokens_per_second = if matches!(self.status, ProcessingStatus::Streaming) {
             self.compute_streaming_tps()
@@ -1573,11 +1581,10 @@ impl crate::tui::TuiState for App {
             read_tokens: history_read.saturating_add(self.token_accounting.total_cache_read_tokens),
             creation_tokens: history_write
                 .saturating_add(self.token_accounting.total_cache_creation_tokens),
-            optimal_input_tokens: if history_read == 0 {
-                self.token_accounting.total_cache_optimal_input_tokens
-            } else {
-                0
-            },
+            // History has no optimal denominator, so the yield uses live-only
+            // reads against live-only optimal input.
+            optimal_input_tokens: self.token_accounting.total_cache_optimal_input_tokens,
+            optimal_read_tokens: Some(self.token_accounting.total_cache_optimal_read_tokens),
             last_reported_input_tokens: self.token_accounting.last_cache_reported_input_tokens,
             last_read_tokens: self.token_accounting.last_cache_read_tokens,
             last_creation_tokens: self.token_accounting.last_cache_creation_tokens,
@@ -1689,6 +1696,8 @@ impl crate::tui::TuiState for App {
                 false
             },
             git_info: gather_git_info(),
+            agent_edited: self.agent_edited_paths(),
+            window_account,
         }
     }
 
@@ -1894,6 +1903,9 @@ impl crate::tui::TuiState for App {
     fn side_panel(&self) -> &crate::side_panel::SidePanelSnapshot {
         &self.side_panel
     }
+    fn side_panel_fullscreen(&self) -> bool {
+        self.side_panel_fullscreen
+    }
     fn pin_images(&self) -> bool {
         self.pin_images && !self.side_panel_user_hidden
     }
@@ -1996,6 +2008,10 @@ impl crate::tui::TuiState for App {
 
     fn copy_selection_range(&self) -> Option<crate::tui::CopySelectionRange> {
         self.normalized_copy_selection()
+    }
+
+    fn input_selection_range(&self) -> Option<(usize, usize)> {
+        self.input_selection()
     }
 
     fn copy_selection_status(&self) -> Option<crate::tui::CopySelectionStatus> {

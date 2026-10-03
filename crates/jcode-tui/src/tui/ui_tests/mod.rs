@@ -143,8 +143,8 @@ struct TestState {
     side_pane_images: Vec<crate::session::RenderedImage>,
     pin_images: bool,
     inline_images_visible: bool,
-    chat_overscroll_active: bool,
     cache_ttl_status: Option<crate::tui::CacheTtlInfo>,
+    openai_reset_hint: Option<&'static str>,
     status_notice: Option<String>,
     time_since_user_interaction: Option<Duration>,
     swarm_members: Vec<crate::protocol::SwarmMemberStatus>,
@@ -152,6 +152,8 @@ struct TestState {
     swarm_panel_selected: usize,
     swarm_panel_focused: bool,
     swarm_panel_full_page: bool,
+    /// First transcript line shown when scrolled; `Some` pauses auto-follow.
+    scroll_top_line: Option<usize>,
 }
 
 impl crate::tui::TuiState for TestState {
@@ -204,10 +206,10 @@ impl crate::tui::TuiState for TestState {
         &self.pending_soft_interrupts
     }
     fn scroll_offset(&self) -> usize {
-        0
+        self.scroll_top_line.unwrap_or(0)
     }
     fn auto_scroll_paused(&self) -> bool {
-        false
+        self.scroll_top_line.is_some()
     }
     fn provider_name(&self) -> String {
         self.provider_name
@@ -266,14 +268,6 @@ impl crate::tui::TuiState for TestState {
     }
     fn time_since_activity(&self) -> Option<Duration> {
         self.time_since_activity
-    }
-    fn chat_overscroll_active(&self) -> bool {
-        self.chat_overscroll_active
-    }
-    fn chat_overscroll_remaining(&self) -> Option<f32> {
-        // TestState models the elastic reveal: while active, a countdown is
-        // depleting (a config-pinned line would report None here instead).
-        self.chat_overscroll_active.then_some(1.0)
     }
     fn total_session_tokens(&self) -> Option<(u64, u64)> {
         None
@@ -496,6 +490,10 @@ impl crate::tui::TuiState for TestState {
     fn cache_ttl_status(&self) -> Option<crate::tui::CacheTtlInfo> {
         self.cache_ttl_status.clone()
     }
+
+    fn openai_reset_hint(&self) -> Option<String> {
+        self.openai_reset_hint.map(str::to_owned)
+    }
     fn chat_native_scrollbar(&self) -> bool {
         self.chat_native_scrollbar
     }
@@ -514,6 +512,8 @@ fn reset_prompt_viewport_state_for_test() {
 mod basic;
 #[path = "diagrams.rs"]
 mod diagrams;
+#[path = "info_dock.rs"]
+mod info_dock;
 #[path = "inline_picker.rs"]
 mod inline_picker;
 #[path = "onboarding.rs"]

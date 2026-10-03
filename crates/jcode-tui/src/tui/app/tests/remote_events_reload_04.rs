@@ -97,6 +97,7 @@ fn test_remote_error_without_retry_recovers_pending_followups() {
         auto_retry: false,
         retry_attempts: 0,
         retry_at: None,
+        overload_attempts: 0,
     });
     app.is_processing = true;
     app.status = ProcessingStatus::Streaming;
@@ -111,6 +112,7 @@ fn test_remote_error_without_retry_recovers_pending_followups() {
             id: 10,
             message: "provider failed hard".to_string(),
             retry_after_secs: None,
+            server_resumes: false,
         },
         &mut remote,
     );
@@ -163,6 +165,7 @@ fn test_remote_error_with_retryable_pending_schedules_retry() {
         auto_retry: true,
         retry_attempts: 0,
         retry_at: None,
+        overload_attempts: 0,
     });
     app.is_processing = true;
     app.status = ProcessingStatus::Streaming;
@@ -172,6 +175,7 @@ fn test_remote_error_with_retryable_pending_schedules_retry() {
             id: 11,
             message: "provider failed hard".to_string(),
             retry_after_secs: None,
+            server_resumes: false,
         },
         &mut remote,
     );
@@ -191,10 +195,11 @@ fn test_remote_error_with_retryable_pending_schedules_retry() {
         .expect("retry should surface a connection status message");
     assert_eq!(retry_notice.role, "system");
     assert!(retry_notice.content.contains("Connection lost - retrying"));
-    assert!(retry_notice.content.contains(&format!(
-        "attempt 1/{}",
-        App::AUTO_RETRY_MAX_ATTEMPTS
-    )));
+    assert!(
+        retry_notice
+            .content
+            .contains(&format!("attempt 1/{}", App::AUTO_RETRY_MAX_ATTEMPTS))
+    );
     assert!(retry_notice.content.contains("Remote request failed"));
 }
 
@@ -217,6 +222,7 @@ fn test_remote_non_retryable_error_gets_short_auto_poke_retry() {
         auto_retry: true,
         retry_attempts: 0,
         retry_at: None,
+        overload_attempts: 0,
     });
     app.is_processing = true;
     app.status = ProcessingStatus::Streaming;
@@ -226,6 +232,7 @@ fn test_remote_non_retryable_error_gets_short_auto_poke_retry() {
             id: 12,
             message: "OpenAI API error 400 Bad Request: {\"error\":{\"message\":\"Invalid 'input[0].encrypted_content': string too long. Expected a string with maximum length 10485760, but got a string with length 11237432 instead.\",\"type\":\"invalid_request_error\",\"code\":\"string_above_max_length\"}}".to_string(),
             retry_after_secs: None,
+            server_resumes: false,
         },
         &mut remote,
     );
@@ -248,6 +255,7 @@ fn test_remote_non_retryable_error_gets_short_auto_poke_retry() {
             id: 13,
             message: "OpenAI API error 400 Bad Request: {\"error\":{\"type\":\"invalid_request_error\",\"code\":\"string_above_max_length\"}}".to_string(),
             retry_after_secs: None,
+            server_resumes: false,
         },
         &mut remote,
     );
@@ -284,6 +292,7 @@ fn test_remote_non_retryable_error_stops_auto_poke_after_short_retry_budget() {
         auto_retry: true,
         retry_attempts: 2,
         retry_at: None,
+        overload_attempts: 0,
     });
     app.is_processing = true;
     app.status = ProcessingStatus::Streaming;
@@ -293,6 +302,7 @@ fn test_remote_non_retryable_error_stops_auto_poke_after_short_retry_budget() {
             id: 14,
             message: "OpenAI API error 400 Bad Request: {\"error\":{\"type\":\"invalid_request_error\",\"code\":\"string_above_max_length\"}}".to_string(),
             retry_after_secs: None,
+            server_resumes: false,
         },
         &mut remote,
     );
@@ -329,6 +339,7 @@ fn test_remote_fatal_model_endpoint_error_fails_fast_without_retry_budget() {
         auto_retry: true,
         retry_attempts: 0,
         retry_at: None,
+        overload_attempts: 0,
     });
     app.is_processing = true;
     app.status = ProcessingStatus::Streaming;
@@ -338,6 +349,7 @@ fn test_remote_fatal_model_endpoint_error_fails_fast_without_retry_budget() {
             id: 21,
             message: "OpenAI-compatible chat request failed\n  endpoint: https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions\n  model: volcengine:ark-code-latest\n  auth: ARK_API_KEY\n  status: 404 Not Found\n  response: {\"error\":{\"code\":\"UnsupportedModel\",\"message\":\"The requested model does not support the coding plan feature.\"}}".to_string(),
             retry_after_secs: None,
+            server_resumes: false,
         },
         &mut remote,
     );
@@ -366,7 +378,7 @@ fn test_remote_fatal_model_endpoint_error_fails_fast_without_retry_budget() {
 }
 
 #[test]
-fn test_remote_connectivity_error_waits_for_network_without_retry_budget() {
+fn test_remote_connectivity_error_waits_for_network_with_bounded_retry_budget() {
     let mut app = create_test_app();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();
@@ -384,6 +396,7 @@ fn test_remote_connectivity_error_waits_for_network_without_retry_budget() {
         auto_retry: true,
         retry_attempts: 0,
         retry_at: None,
+        overload_attempts: 0,
     });
     app.is_processing = true;
     app.status = ProcessingStatus::Streaming;
@@ -393,6 +406,7 @@ fn test_remote_connectivity_error_waits_for_network_without_retry_budget() {
             id: 15,
             message: "Failed to send OpenAI-compatible chat request\n  endpoint: https://api.groq.com/openai/v1/chat/completions\n  model: llama-3.1-8b-instant\n  auth: GROQ_API_KEY\nHint: check network connectivity, DNS/TLS, and that the base URL includes the API version (usually /v1).: error sending request for url (https://api.groq.com/openai/v1/chat/completions): client error (Connect): dns error: failed to lookup address information: Name or service not known".to_string(),
             retry_after_secs: None,
+            server_resumes: false,
         },
         &mut remote,
     );
@@ -402,8 +416,8 @@ fn test_remote_connectivity_error_waits_for_network_without_retry_budget() {
     let pending = app
         .rate_limit_pending_message
         .as_ref()
-        .expect("offline auto-poke should be held for network recovery");
-    assert_eq!(pending.retry_attempts, 0);
+        .expect("provider failure should be held for bounded network recovery");
+    assert_eq!(pending.retry_attempts, 1);
     assert!(app.rate_limit_reset.is_some());
     assert!(matches!(
         app.status,
@@ -411,7 +425,7 @@ fn test_remote_connectivity_error_waits_for_network_without_retry_budget() {
     ));
     assert_eq!(
         app.status_detail.as_deref(),
-        Some("offline; waiting for network before retry")
+        Some("connection failed; waiting before retry")
     );
     assert!(
         app.display_messages()
@@ -446,6 +460,7 @@ fn test_remote_connectivity_error_without_auto_retry_still_waits_for_network() {
         auto_retry: false,
         retry_attempts: 0,
         retry_at: None,
+        overload_attempts: 0,
     });
     app.is_processing = true;
     app.status = ProcessingStatus::Streaming;
@@ -455,6 +470,7 @@ fn test_remote_connectivity_error_without_auto_retry_still_waits_for_network() {
             id: 16,
             message: "Failed to send request to Anthropic API: error sending request for url (https://api.anthropic.com/v1/messages): client error (Connect): dns error: failed to lookup address information: Name or service not known".to_string(),
             retry_after_secs: None,
+            server_resumes: false,
         },
         &mut remote,
     );
@@ -466,9 +482,10 @@ fn test_remote_connectivity_error_without_auto_retry_still_waits_for_network() {
         .rate_limit_pending_message
         .as_ref()
         .expect("offline turn should be held for network recovery");
-    // Promoted to auto_retry so the tick-based resume re-sends it.
+    // Promoted to auto_retry so the tick-based resume re-sends it, with the
+    // provider failure consuming one attempt rather than looping forever.
     assert!(pending.auto_retry);
-    assert_eq!(pending.retry_attempts, 0);
+    assert_eq!(pending.retry_attempts, 1);
     assert!(app.rate_limit_reset.is_some());
     assert!(matches!(
         app.status,
@@ -532,6 +549,7 @@ fn test_remote_auth_error_arms_fallback_offer_with_resend_payload() {
         auto_retry: false,
         retry_attempts: 0,
         retry_at: None,
+        overload_attempts: 0,
     });
     app.last_submitted_input = Some("hi".to_string());
     app.is_processing = true;
@@ -542,6 +560,7 @@ fn test_remote_auth_error_arms_fallback_offer_with_resend_payload() {
             id: 21,
             message: "OpenAI token refresh failed; run /login to re-authenticate: {\"error\":{\"message\":\"Your session has ended. Please log in again.\",\"type\":\"invalid_request_error\",\"code\":\"refresh_token_invalidated\"}}".to_string(),
             retry_after_secs: None,
+            server_resumes: false,
         },
         &mut remote,
     );
@@ -593,6 +612,7 @@ fn test_remote_fallback_offer_accept_stages_switch_and_resends() {
         auto_retry: false,
         retry_attempts: 0,
         retry_at: None,
+        overload_attempts: 0,
     });
     app.last_submitted_input = Some("hi".to_string());
     app.is_processing = true;
@@ -603,6 +623,7 @@ fn test_remote_fallback_offer_accept_stages_switch_and_resends() {
             id: 22,
             message: "OpenAI token refresh failed; run /login to re-authenticate: refresh_token_invalidated".to_string(),
             retry_after_secs: None,
+            server_resumes: false,
         },
         &mut remote,
     );
@@ -628,6 +649,8 @@ fn test_remote_fallback_offer_accept_stages_switch_and_resends() {
             model: "claude-sonnet-4".to_string(),
             provider_name: Some("Anthropic".to_string()),
             error: None,
+            resolved_credential: None,
+            reasoning_effort: None,
         },
         &mut remote,
     );
@@ -672,6 +695,8 @@ fn test_remote_fallback_resend_dropped_when_switch_fails() {
             model: "claude-sonnet-4".to_string(),
             provider_name: None,
             error: Some("switch failed".to_string()),
+            resolved_credential: None,
+            reasoning_effort: None,
         },
         &mut remote,
     );
@@ -697,6 +722,7 @@ fn test_schedule_pending_remote_retry_respects_retry_limit() {
         auto_retry: true,
         retry_attempts: App::AUTO_RETRY_MAX_ATTEMPTS,
         retry_at: None,
+        overload_attempts: 0,
     });
 
     assert!(!app.schedule_pending_remote_retry("⚠ failed."));
@@ -735,6 +761,7 @@ fn test_provider_guardrail_event_offers_opus_reroute_with_resend_payload() {
         auto_retry: false,
         retry_attempts: 0,
         retry_at: None,
+        overload_attempts: 0,
     });
     app.last_submitted_input = Some("please help".to_string());
 
@@ -1267,10 +1294,7 @@ fn test_tui_grok_build_login_starts_managed_oauth_flow() {
 
     app.start_login_provider(crate::provider_catalog::GROK_BUILD_LOGIN_PROVIDER);
 
-    assert!(matches!(
-        app.pending_login,
-        Some(PendingLogin::GrokBuild)
-    ));
+    assert!(matches!(app.pending_login, Some(PendingLogin::GrokBuild)));
     let rendered = app
         .display_messages()
         .iter()
@@ -1393,6 +1417,31 @@ fn test_info_widget_remote_anthropic_api_key_shows_cost_based_usage() {
     );
 }
 
+/// Before the first Anthropic usage fetch lands, the usage state is an empty
+/// default (0% used, no error). The widget must not treat that as data: it
+/// used to flash "100% left" for both limits at startup.
+#[test]
+fn test_info_widget_anthropic_oauth_usage_waits_for_first_fetch() {
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_provider_name = Some("Claude".to_string());
+    app.remote_provider_model = Some("claude-sonnet-4-20250514".to_string());
+    app.remote_resolved_credential = Some(jcode_provider_core::ResolvedCredential::Oauth);
+
+    let data = crate::tui::TuiState::info_widget_data(&app);
+    let usage = data.usage_info.as_ref().expect("anthropic usage info");
+    assert!(
+        !usage.available,
+        "unfetched usage must not render as limits: 5h={} 7d={}",
+        usage.five_hour, usage.seven_day
+    );
+    let text = crate::tui::info_widget::dock_text_lines(&data, 44).join("\n");
+    assert!(
+        !text.contains("100% left"),
+        "startup must not claim full limits:\n{text}"
+    );
+}
+
 #[test]
 fn test_info_widget_remote_openai_billing_follows_resolved_credential() {
     let mut app = create_test_app();
@@ -1471,6 +1520,23 @@ fn test_info_widget_remote_openai_uses_explicit_route_when_credential_is_missing
 #[test]
 fn test_info_widget_local_direct_api_runtime_shows_cost_based_usage() {
     let _guard = crate::storage::lock_test_env();
+    // Restore on unwind, not only on the success path: a mid-test assertion
+    // panic used to leave these vars cleared, poisoning concurrently running
+    // auth tests that read the same process env (openrouter/named-profile
+    // state) and turning this test into a cross-suite flake source.
+    struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                if let Some(value) = value {
+                    crate::env::set_var(key, value);
+                } else {
+                    crate::env::remove_var(key);
+                }
+            }
+            crate::auth::AuthStatus::invalidate_cache();
+        }
+    }
     let tracked_env = [
         "JCODE_RUNTIME_PROVIDER",
         "JCODE_OPENROUTER_ALLOW_NO_AUTH",
@@ -1482,11 +1548,13 @@ fn test_info_widget_local_direct_api_runtime_shows_cost_based_usage() {
         "JCODE_PROVIDER_PROFILE_ACTIVE",
         "JCODE_PROVIDER_PROFILE_NAME",
     ];
-    let saved_env = tracked_env
-        .iter()
-        .map(|&key| (key, std::env::var_os(key)))
-        .collect::<Vec<_>>();
-    for &key in &tracked_env {
+    let _restore = RestoreEnv(
+        tracked_env
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect(),
+    );
+    for key in tracked_env {
         crate::env::remove_var(key);
     }
 
@@ -1594,15 +1662,6 @@ fn test_info_widget_local_direct_api_runtime_shows_cost_based_usage() {
         crate::tui::info_widget::AuthMethod::Unknown
     );
     assert!(data.usage_info.is_none());
-
-    for (key, value) in saved_env {
-        if let Some(value) = value {
-            crate::env::set_var(key, value);
-        } else {
-            crate::env::remove_var(key);
-        }
-    }
-    crate::auth::AuthStatus::invalidate_cache();
 }
 
 #[test]
@@ -1972,7 +2031,9 @@ fn test_debug_command_side_panel_latency_bench_reports_immediate_redraw() {
     // against 16.0ms purely from machine load, while passing in isolation. The
     // behavioral assertions above are the real subject, so gate only the timing
     // (refs #592).
-    let p95 = value["summary"]["latency_ms"]["p95"].as_f64().unwrap_or(0.0);
+    let p95 = value["summary"]["latency_ms"]["p95"]
+        .as_f64()
+        .unwrap_or(0.0);
     assert_perf_budget(p95 < 16.0, || {
         format!("side-panel p95 should stay within a 60fps frame budget: {result}")
     });
@@ -2259,7 +2320,10 @@ fn test_externally_started_turn_adopts_processing_state_and_settles_on_done() {
         app.status
     );
 
-    app.handle_server_event(crate::protocol::ServerEvent::MessageEnd { stop_reason: None }, &mut remote);
+    app.handle_server_event(
+        crate::protocol::ServerEvent::MessageEnd { stop_reason: None },
+        &mut remote,
+    );
     app.handle_server_event(crate::protocol::ServerEvent::Done { id: 0 }, &mut remote);
 
     // Streaming text is revealed at a paced rate, so a `Done` that arrives with
@@ -2426,6 +2490,7 @@ fn test_credential_failure_breaker_trips_after_consecutive_auth_errors() {
             auto_retry: true,
             retry_attempts: 0,
             retry_at: None,
+            overload_attempts: 0,
         });
         app.is_processing = true;
         app.status = ProcessingStatus::Streaming;
@@ -2434,6 +2499,7 @@ fn test_credential_failure_breaker_trips_after_consecutive_auth_errors() {
                 id: 100 + u64::from(attempt),
                 message: "401 Unauthorized: invalid api key".to_string(),
                 retry_after_secs: None,
+                server_resumes: false,
             },
             &mut remote,
         );
@@ -2490,5 +2556,90 @@ fn test_credential_failure_breaker_resets_on_turn_success() {
     assert_eq!(
         app.consecutive_credential_failures, 0,
         "a successful turn must reset the credential-failure streak"
+    );
+}
+
+/// An OAuth -> API-key route switch must update the auth badge immediately,
+/// instead of keeping the previous route's server-resolved credential.
+#[test]
+fn test_remote_model_changed_updates_resolved_credential() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    remote.mark_history_loaded();
+
+    app.is_remote = true;
+    app.remote_provider_name = Some("Claude".to_string());
+    app.remote_resolved_credential = Some(jcode_provider_core::ResolvedCredential::Oauth);
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::ModelChanged {
+            id: 0,
+            model: "claude-opus-5-5".to_string(),
+            provider_name: Some("Claude".to_string()),
+            error: None,
+            resolved_credential: Some(jcode_provider_core::ResolvedCredential::ApiKey),
+            reasoning_effort: None,
+        },
+        &mut remote,
+    );
+
+    assert_eq!(
+        app.remote_resolved_credential,
+        Some(jcode_provider_core::ResolvedCredential::ApiKey)
+    );
+    let data = crate::tui::TuiState::info_widget_data(&app);
+    assert_eq!(
+        data.auth_method,
+        crate::tui::info_widget::AuthMethod::AnthropicApiKey
+    );
+}
+
+fn model_changed_event(
+    error: Option<&str>,
+    reasoning_effort: Option<&str>,
+) -> crate::protocol::ServerEvent {
+    crate::protocol::ServerEvent::ModelChanged {
+        id: 0,
+        model: "gpt-5.6-terra".to_string(),
+        provider_name: Some("OpenAI".to_string()),
+        error: error.map(str::to_string),
+        resolved_credential: None,
+        reasoning_effort: reasoning_effort.map(str::to_string),
+    }
+}
+
+/// Issue #1504: the effort chip must follow the effort the server reports for
+/// the switched-to model: adopt a new level, clear on `None`, and leave the
+/// running model's effort untouched when the switch fails.
+#[test]
+fn test_remote_model_changed_updates_reasoning_effort() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    remote.mark_history_loaded();
+    app.is_remote = true;
+
+    app.remote_reasoning_effort = Some("medium".to_string());
+    app.handle_server_event(model_changed_event(None, Some("high")), &mut remote);
+    assert_eq!(app.remote_reasoning_effort.as_deref(), Some("high"));
+
+    app.handle_server_event(model_changed_event(None, None), &mut remote);
+    assert!(
+        app.remote_reasoning_effort.is_none(),
+        "a switch to a model without effort must clear the chip"
+    );
+
+    app.remote_reasoning_effort = Some("low".to_string());
+    app.handle_server_event(
+        model_changed_event(Some("switch failed"), None),
+        &mut remote,
+    );
+    assert_eq!(
+        app.remote_reasoning_effort.as_deref(),
+        Some("low"),
+        "a failed switch keeps the running model's effort"
     );
 }

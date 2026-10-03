@@ -8,9 +8,7 @@ mod layout_support;
 mod util_support;
 use crate::tui::mermaid;
 #[cfg(test)]
-use layout_support::{
-    clamp_side_panel_image_rows, estimate_side_panel_image_rows_with_font,
-};
+use layout_support::{clamp_side_panel_image_rows, estimate_side_panel_image_rows_with_font};
 use layout_support::{
     estimate_side_panel_image_layout, estimate_side_panel_image_layout_with_font,
     fit_image_area_with_font, plan_fit_image_render, scaled_image_rows,
@@ -46,6 +44,14 @@ fn side_panel_content_area(area: Rect) -> Option<Rect> {
         width: inner.width,
         height: inner.height - SIDE_PANEL_HEADER_HEIGHT,
     })
+}
+
+pub(crate) fn side_panel_close_area(area: Rect) -> Option<Rect> {
+    if area.width < 10 || area.height < 3 {
+        return None;
+    }
+    let inner = side_panel_inner(area);
+    Some(Rect::new(inner.right().saturating_sub(3), inner.y, 3, 1))
 }
 
 fn side_panel_content_may_contain_mermaid(content: &str) -> bool {
@@ -580,13 +586,20 @@ pub(super) fn draw_side_panel_markdown(
         format!(" {}/{} ", page_index, page_count),
         Style::default().fg(dim_color()),
     ));
-    title_parts.push(Span::styled(
-        format!(
-            " {} hide ",
-            crate::tui::keybind::side_panel_toggle_key_label()
-        ),
-        Style::default().fg(dim_color()),
-    ));
+    let toggle_hint = format!(
+        " {} {} ",
+        crate::tui::keybind::side_panel_toggle_key_label(),
+        if app.side_panel_fullscreen() {
+            "hide"
+        } else {
+            "fullscreen"
+        }
+    );
+    if Line::from(title_parts.clone()).width() + Line::from(toggle_hint.as_str()).width()
+        <= side_panel_inner(area).width.saturating_sub(3) as usize
+    {
+        title_parts.push(Span::styled(toggle_hint, Style::default().fg(dim_color())));
+    }
     if focused {
         title_parts.push(Span::styled(
             " j/k scroll ",
@@ -630,6 +643,12 @@ pub(super) fn draw_side_panel_markdown(
     else {
         return;
     };
+    if let Some(close_area) = side_panel_close_area(area) {
+        frame.render_widget(
+            Paragraph::new(" x ").style(Style::default().fg(dim_color())),
+            close_area,
+        );
+    }
     let show_native_scrollbar = super::native_scrollbar_visible(
         app.side_panel_native_scrollbar() && content_shell_area.width > 1,
         rendered_full_width.lines.len(),

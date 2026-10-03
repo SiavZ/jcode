@@ -352,6 +352,34 @@ async fn handle_remote_key_internal(
             if let Some(model) = subagent_model {
                 remote.set_subagent_model(model).await?;
             }
+            if !app.agent_models_global_scope
+                && let Some((target, model)) = picker
+                    .filtered
+                    .get(picker.selected)
+                    .and_then(|index| picker.entries.get(*index))
+                    .and_then(|entry| match entry.action {
+                        crate::tui::PickerAction::AgentModelChoice {
+                            target,
+                            clear_override,
+                        } => Some((
+                            match target {
+                                crate::tui::AgentModelTarget::Swarm => "swarm",
+                                crate::tui::AgentModelTarget::Review => "review",
+                                crate::tui::AgentModelTarget::Judge => "judge",
+                                crate::tui::AgentModelTarget::Memory => "memory",
+                                crate::tui::AgentModelTarget::Ambient => "ambient",
+                            }
+                            .to_string(),
+                            (!clear_override).then(|| {
+                                super::super::inline_interactive::subagent_picker_model_spec(entry)
+                            }),
+                        )),
+                        _ => None,
+                    })
+            {
+                app.pending_agent_model_request_id =
+                    Some(remote.set_agent_model(target, model).await?);
+            }
         }
         return app.handle_inline_interactive_key(code, modifiers);
     }
@@ -366,6 +394,13 @@ async fn handle_remote_key_internal(
     // can claim them. This mirrors the local path in `input.rs`
     // `handle_key_core`.
     if app.model_picker_preview_hotkey(code, modifiers)? {
+        return Ok(());
+    }
+
+    // Composer text selection (copy/cut/delete/extend) takes priority over
+    // the whole-line Ctrl+X, the Ctrl+C interrupt/quit, and plain arrow moves.
+    // Mirrors the local path in `input.rs` `handle_key_core`.
+    if crate::tui::app::input_selection::handle_input_selection_key(app, code, modifiers) {
         return Ok(());
     }
 
@@ -404,6 +439,18 @@ async fn handle_remote_key_internal(
         }
         app.handle_new_terminal_hotkey();
         return Ok(());
+    }
+
+    // A running provider auto-switch countdown: Esc (or any other
+    // non-scroll key) cancels it before anything is sent to the target.
+    if app.pending_provider_failover.is_some() && !app.is_processing {
+        if code == KeyCode::Esc {
+            app.cancel_pending_provider_failover("Provider auto-switch canceled");
+            return Ok(());
+        }
+        if !input::is_scroll_only_key(app, code, modifiers) {
+            app.cancel_pending_provider_failover("Provider auto-switch canceled");
+        }
     }
 
     // Accept an armed post-error fallback offer: stage the route switch and
@@ -482,6 +529,15 @@ async fn handle_remote_key_internal(
 
     if app.toggle_keys.copy_selection.matches(code, modifiers) {
         app.toggle_copy_selection_mode();
+        return Ok(());
+    }
+
+    if app
+        .toggle_keys
+        .diagram_pane_visibility
+        .matches(code, modifiers)
+    {
+        app.toggle_diagram_pane();
         return Ok(());
     }
 
@@ -693,6 +749,11 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
 
+    if app.scroll_keys.is_to_bottom(code, modifiers) {
+        app.jump_to_chat_bottom();
+        return Ok(());
+    }
+
     if app.scroll_keys.is_bookmark(code, modifiers) {
         app.toggle_scroll_bookmark();
         return Ok(());
@@ -742,7 +803,7 @@ async fn handle_remote_key_internal(
                     remote.cancel_with_reason("keyboard_ctrl_c_or_d").await?;
                     app.set_status_notice("Interrupting...");
                 } else {
-                    app.handle_quit_request();
+                    input::clear_draft_or_request_quit(app);
                 }
                 return Ok(());
             }
@@ -961,6 +1022,25 @@ async fn handle_remote_key_internal(
                 let prepared = input::take_prepared_input(app);
                 let trimmed = prepared.expanded.trim();
 
+                // Before the SSH gate: `/local` must work from a client attached
+                // to the cloud copy, because the return is coordinated locally.
+                if app_mod::commands_cloud::parse_cloud_command(trimmed).is_some() {
+                    let session_id = app_mod::commands::active_session_id(app);
+                    if crate::tui::is_ssh_remote()
+                        && matches!(
+                            app_mod::commands_cloud::parse_cloud_command(trimmed),
+                            Some(app_mod::commands_cloud::CloudCommand::Move { .. })
+                        )
+                    {
+                        app.push_display_message(DisplayMessage::error(
+                            "This session already runs on a remote host. Use /local to bring it back first.".to_string(),
+                        ));
+                        return Ok(());
+                    }
+                    app_mod::commands_cloud::handle_cloud_command(app, trimmed, &session_id);
+                    return Ok(());
+                }
+
                 if app_mod::commands_dispatch::handle_ssh_unsupported_command(app, trimmed) {
                     return Ok(());
                 }
@@ -1117,6 +1197,10 @@ async fn handle_remote_key_internal(
                     // catalog I/O; doing it here races startup and briefly
                     // replaces the session catalog with remote fallback rows.
                     app.open_model_picker();
+                    return Ok(());
+                }
+
+                if app.handle_usage_reset_command(trimmed) {
                     return Ok(());
                 }
 
@@ -1464,7 +1548,7 @@ async fn handle_remote_key_internal(
                         "Autoreview",
                         parent_session_id.clone(),
                         app_mod::commands::build_autoreview_startup_message(&parent_session_id),
-                        crate::config::config().autoreview.model.clone(),
+                        app_mod::commands::current_autoreview_model_override(app),
                         None,
                     );
                     if app.is_processing {
@@ -1522,7 +1606,7 @@ async fn handle_remote_key_internal(
                         "Autojudge",
                         parent_session_id.clone(),
                         app_mod::commands::build_autojudge_startup_message(&parent_session_id),
-                        crate::config::config().autojudge.model.clone(),
+                        app_mod::commands::current_autojudge_model_override(app),
                         None,
                     );
                     if app.is_processing {
@@ -1550,11 +1634,7 @@ async fn handle_remote_key_internal(
 
                 if trimmed == "/review" {
                     let (model_override, provider_key_override) =
-                        app_mod::commands::preferred_one_shot_review_override()
-                            .map(|(model, provider_key)| (Some(model), Some(provider_key)))
-                            .unwrap_or_else(|| {
-                                (crate::config::config().autoreview.model.clone(), None)
-                            });
+                        app_mod::commands::current_review_model_override(app);
                     let parent_session_id =
                         app_mod::commands::current_feedback_target_session_id(app);
                     app_mod::commands::queue_review_spawn_remote(
@@ -1590,11 +1670,7 @@ async fn handle_remote_key_internal(
 
                 if trimmed == "/judge" {
                     let (model_override, provider_key_override) =
-                        app_mod::commands::preferred_one_shot_review_override()
-                            .map(|(model, provider_key)| (Some(model), Some(provider_key)))
-                            .unwrap_or_else(|| {
-                                (crate::config::config().autojudge.model.clone(), None)
-                            });
+                        app_mod::commands::current_judge_model_override(app);
                     let parent_session_id =
                         app_mod::commands::current_feedback_target_session_id(app);
                     app_mod::commands::queue_review_spawn_remote(
@@ -1775,6 +1851,10 @@ async fn handle_remote_key_internal(
                     return Ok(());
                 }
 
+                if app.handle_side_command(trimmed) {
+                    return Ok(());
+                }
+
                 if trimmed == "/observe"
                     || trimmed == "/observe on"
                     || trimmed == "/observe off"
@@ -1889,6 +1969,9 @@ async fn handle_remote_key_internal(
                         )));
                         return Ok(());
                     }
+                    // The daemon's in-memory session owns later writes. Without
+                    // this it would persist `saved: false` on its next save.
+                    remote.set_session_saved(true, label.clone()).await?;
                     crate::tui::session_picker::invalidate_session_list_cache();
                     if app.memory_enabled
                         && let Err(err) = remote.trigger_memory_extraction().await
@@ -1925,6 +2008,7 @@ async fn handle_remote_key_internal(
                         )));
                         return Ok(());
                     }
+                    remote.set_session_saved(false, None).await?;
                     crate::tui::session_picker::invalidate_session_list_cache();
                     let name = app.session.display_name().to_string();
                     app.push_display_message(DisplayMessage::system(format!(
@@ -2014,6 +2098,7 @@ async fn handle_remote_key_internal(
 
                 if trimmed == "/commit"
                     || trimmed == "/merge"
+                    || trimmed == "/merge-remote-release"
                     || trimmed == "/commit-push"
                     || trimmed == "/commit-and-push"
                     || trimmed == "/fast-release"
@@ -2032,8 +2117,11 @@ async fn handle_remote_key_internal(
                     let is_remote_release = trimmed == "/remote-release";
                     let is_fast_macos_release = trimmed == "/fast-macos-release";
                     let is_merge = trimmed == "/merge";
+                    let is_merge_remote_release = trimmed == "/merge-remote-release";
                     let is_push = matches!(trimmed, "/commit-push" | "/commit-and-push");
-                    let prompt = if is_merge {
+                    let prompt = if is_merge_remote_release {
+                        app_mod::commands::build_merge_remote_release_prompt()
+                    } else if is_merge {
                         app_mod::commands::build_merge_prompt()
                     } else if is_triage {
                         app_mod::commands::build_triage_prompt(
@@ -2051,7 +2139,9 @@ async fn handle_remote_key_internal(
                         app_mod::commands::build_commit_prompt()
                     };
                     let launch_notice = |interrupted: bool| {
-                        if is_merge {
+                        if is_merge_remote_release {
+                            app_mod::commands::merge_remote_release_launch_notice(interrupted)
+                        } else if is_merge {
                             app_mod::commands::merge_launch_notice(interrupted)
                         } else if is_triage {
                             app_mod::commands::triage_launch_notice(interrupted)
@@ -2067,7 +2157,9 @@ async fn handle_remote_key_internal(
                             app_mod::commands::commit_launch_notice(interrupted)
                         }
                     };
-                    let cmd_label = if is_merge {
+                    let cmd_label = if is_merge_remote_release {
+                        "/merge-remote-release"
+                    } else if is_merge {
                         "/merge"
                     } else if is_triage {
                         "/triage"
@@ -2689,6 +2781,18 @@ async fn handle_remote_key_internal(
             {
                 app.inline_interactive_state = None;
                 input::clear_input_for_escape(app);
+            } else if app.is_processing && app.has_pending_user_followup() {
+                // The user typed a new prompt while this turn ran, then hit
+                // Esc: stop this turn and run the new prompt next. The server
+                // leaves an unsent soft interrupt queued on cancel, and the
+                // follow-up recovery path sends it as the next turn. Auto-poke
+                // stays on: this is a redirect, not "stop everything".
+                remote
+                    .cancel_with_reason("keyboard_escape_redirect")
+                    .await?;
+                app.remote_interrupt_ack_deadline =
+                    Some(Instant::now() + std::time::Duration::from_secs(3));
+                app.set_status_notice("Interrupting... sending your next prompt");
             } else if app.is_processing {
                 let disabled_auto_poke = app.auto_poke_incomplete_todos
                     || app

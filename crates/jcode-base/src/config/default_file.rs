@@ -56,6 +56,10 @@ scroll_prompt_down = "ctrl+]"
 # Scroll bookmark toggle (stash position, jump to bottom, press again to return)
 scroll_bookmark = "ctrl+g"
 
+# Jump to the bottom of the chat and resume auto-follow (also: click the
+# "Jump to bottom" pill shown while scrolled up). Comma-separate aliases.
+scroll_to_bottom = "ctrl+end, alt+q"
+
 # Auto-poke toggle. Set "" to disable.
 auto_poke_toggle = "ctrl+p"
 
@@ -75,6 +79,7 @@ workspace_right = "alt+l"
 side_panel_toggle = "alt+m"
 copy_selection_toggle = "alt+y"
 diagram_pane_toggle = "alt+t"
+diagram_pane_visibility_toggle = "alt+shift+m"
 typing_scroll_lock_toggle = "alt+s"
 diff_mode_cycle = "alt+g"
 info_widget_toggle = "alt+i"
@@ -100,6 +105,11 @@ swarm_panel_focus = "alt+n"
 # Default: Cmd+B on macOS, Alt+R on Windows/Linux. Set "" to disable.
 # open_resume = "cmd+b"
 
+# Built-in voice input: press to record, press again to send the transcript.
+# Esc cancels. Needs a Nari API key (NARI_API_KEY or ~/.config/jcode/nari.env).
+# Default: Ctrl+Space. Set "" to disable.
+# voice_input = "ctrl+space"
+
 # /resume picker Enter behavior. Options: "current-terminal" or "new-terminal".
 # By default Enter resumes in this terminal; Ctrl+Enter performs the alternate action.
 session_picker_enter = "current-terminal"
@@ -123,6 +133,15 @@ key = "off"
 # Max seconds to wait for the dictation command to finish (0 = no timeout)
 timeout_secs = 90
 
+# Extra names or terms to help built-in voice transcription recognize them.
+# Jcode's own product names are always included.
+# vocabulary = ["Kubernetes", "Alice Zhang"]
+
+# Microphone recorder for built-in voice input (keybindings.voice_input).
+# Empty auto-detects pw-record, parecord, arecord, rec (SoX), or ffmpeg.
+# A custom command must print raw mono 16 kHz signed 16-bit little-endian PCM.
+# recorder = "arecord -q -t raw -f S16_LE -r 16000 -c 1 -"
+
 [display]
 # Diff display mode: "off", "inline" (default), "full-inline", or "file"
 diff_mode = "inline"
@@ -136,6 +155,12 @@ pin_images = true
 # Pin the full session todo list to the top of the chat transcript while it
 # scrolls, like the sticky previous-prompt preview (default: false)
 # pin_todos = true
+
+# Where the info box (model, context, limits, KV cache, git) lives:
+# "dock" (default) keeps it in a fixed column on the right of the chat that
+# never moves while you scroll or a reply streams; the chat wraps beside it.
+# "float" fits it into gaps between chat lines instead (it moves with the text).
+# info_widget_layout = "dock"
 
 # Queue mode: wait until assistant is done before sending next message
 queue_mode = false
@@ -216,12 +241,6 @@ prompt_entry_animation = true
 # (default: true). Set false to list only jcode's own sessions.
 # external_sessions = true
 
-# Overscroll status line (model/provider/context info below the input):
-#   "overscroll" - elastic reveal when scrolling past the bottom (default)
-#   "on"         - always visible
-#   "off"        - never shown
-# overscroll_status = "overscroll"
-
 # Disable specific animation variants by name.
 # Examples: ["donut"] or ["donut", "orbit_rings"]
 # Legacy aliases such as "three_rings" and "gyroscope" are still accepted.
@@ -292,7 +311,15 @@ kv_cache_miss_notices = true
 update_channel = "stable"
 
 [websearch]
-# Preferred websearch engine: "duckduckgo", "bing", or "searxng".
+# Use the model provider's own server-side search (Anthropic web_search on the
+# first-party API, OpenAI Responses web_search) whenever the active
+# provider/model supports it. Searches then run on the provider's side, so they
+# work on servers where DuckDuckGo/Bing scraping is blocked and need no extra
+# key. Providers without native search use the local engines below.
+# Anthropic API keys are billed about $10 per 1,000 searches.
+prefer_native = true
+# Local websearch engine: "duckduckgo", "bing", "searxng", or "native"
+# ("native" forces prefer_native on and otherwise runs fallback_engines).
 engine = "duckduckgo"
 # Keyless HTML engines to try if the preferred engine fails. Default falls back to Bing HTML.
 fallback_engines = ["bing"]
@@ -309,6 +336,16 @@ bing_market = "en-US"
 # this. Configure here or via the JCODE_SEARXNG_URL environment variable, then
 # set engine = "searxng" or add it to fallback_engines.
 # searxng_url = "https://searx.example.org"
+# Native search options (prefer_native):
+# Max provider searches per request (Anthropic only). Caps spend. 0 = no cap.
+# native_max_uses = 5
+# Restrict results to these domains (Anthropic and OpenAI), or block domains
+# (Anthropic only). Set one list, not both.
+# native_allowed_domains = ["docs.rs", "developer.mozilla.org"]
+# native_blocked_domains = ["example.com"]
+# Anthropic tool version. "web_search_20260209" and newer are sent with
+# allowed_callers = ["direct"].
+# native_anthropic_tool_version = "web_search_20250305"
 
 [tools]
 # Controls which built-in tools are sent to the model.
@@ -325,10 +362,15 @@ profile = "full"
 # disabled = ["browser", "gmail", "swarm"]
 # Disable all built-in tools unless enabled is set.
 disable_base_tools = false
-# MCP tool exposure: "eager" sends every server tool definition, "deferred"
-# sends only fixed mcp_search/mcp_call tools, and "auto" switches to deferred
-# when the filtered MCP definitions exceed the token threshold below.
-# Env overrides: JCODE_MCP_TOOLS, JCODE_MCP_TOOLS_TOKEN_THRESHOLD.
+# MCP tool exposure. "auto" never changes the cached tool list when MCP
+# servers connect, reconnect, or register late, so the provider prompt cache
+# survives: Claude and OpenAI (gpt-5.4+) load MCP tools natively as deferred
+# definitions; other providers use fixed mcp_search/mcp_call tools and learn
+# new tools' schemas from the transcript. "deferred" behaves like "auto".
+# "eager" sends every server tool definition in the tool list; adding a
+# server mid-session then invalidates the whole prompt cache.
+# Env overrides: JCODE_MCP_TOOLS. mcp_tools_token_threshold is ignored and
+# kept only so existing configs still parse.
 mcp_tools = "auto"
 mcp_tools_token_threshold = 8000
 
@@ -344,7 +386,7 @@ tool_profile = "acp"
 [provider]
 # Default model (optional, uses provider default if not set)
 # Set via /model picker with Ctrl+B to save as default
-# default_model = "claude-opus-5"
+# default_model = "claude-opus-5-5"
 # Default provider (optional: claude|anthropic-api|openai|openai-api|copilot|openrouter|...)
 # When set, this provider is preferred on startup if available.
 #   claude        = Claude via OAuth/subscription (token in ~/.jcode/auth.json)
@@ -373,8 +415,12 @@ preserve_reasoning_context = true
 # countdown = 3-second countdown before retrying on another provider; press Esc to cancel (default)
 # manual = show a notice and let you switch yourself
 # cross_provider_failover = "manual"
-# Try another account on the same provider before switching providers (default: true)
+# Try another account on the same provider before switching providers (default: true).
+# Only the window that ran out moves. `/account failover off` turns it off per window.
 # same_provider_account_failover = false
+# After failover, go back to the preferred account at the start of a turn once
+# its usage limit has reset (default: true)
+# account_failover_return_home = false
 cross_provider_failover = "countdown"
 # Copilot premium mode: "normal" (default), "one" (first msg only), "zero" (all free)
 # Set to "zero" if you have premium Copilot and want free requests
@@ -478,6 +524,7 @@ swarm_max_concurrent_agents = 32
 #
 # Optional text-generating extraction is separate from recall. Disable it to
 # learn only through the main agent's explicit memory writes.
+# (OpenAI defaults to gpt-5.6-luna with reasoning effort "none").
 # Env overrides: JCODE_MEMORY_SIDECAR_ENABLED, JCODE_MEMORY_MODEL
 # memory_sidecar_enabled = true
 # memory_model = "gpt-5.6-luna"
@@ -548,6 +595,11 @@ swarm_max_concurrent_agents = 32
 # turn_complete_sound = "Glass"
 
 [hooks]
+# Synchronous tool-input transformers. Each receives the tool input JSON on
+# stdin and may print replacement JSON on stdout. Failures and empty output
+# retain the original input. Transformers run before pre_tool policy gates.
+# pre_tool_transform = ["~/.jcode/plugins/rtk-transform"]
+# pre_tool_transform_timeout_ms = 500
 # Lifecycle hooks: external commands jcode runs at well-defined points so other
 # programs can observe or gate agent behavior. Commands are parsed shell-style
 # (quotes work) but executed directly, with JCODE_HOOK_* env vars describing
@@ -631,11 +683,17 @@ bind_addr = "0.0.0.0"
 
 [power]
 # Prevent automatic system sleep while any jcode session is actively working.
-# Linux also blocks lid-switch suspend. Windows still respects explicit lid-close
-# and power-button actions from your active power plan. The display may sleep.
+# Linux also blocks lid-switch suspend. On Windows and macOS see block_lid_close.
+# The display may sleep.
 # The guard is held only for as long as work is in flight. (default: true)
 # Set JCODE_DISABLE_POWER_INHIBIT=1 to force-disable regardless of this setting.
 prevent_sleep_while_streaming = true
+# Also keep working when the lid closes on macOS and Windows while a session is
+# working. Windows temporarily sets the power plan's lid close action to "Do
+# nothing". macOS runs `sudo -n pmset -a disablesleep 1` and needs a passwordless
+# sudoers rule for /usr/bin/pmset (skipped otherwise). Original settings are
+# saved to ~/.jcode/lid_override.json and restored afterwards, even after a crash.
+block_lid_close = true
 
 [safety]
 # Notification settings for ambient mode events
@@ -718,6 +776,11 @@ mod tests {
         let template = Config::default_config_file_contents();
         let config =
             toml::from_str::<Config>(&template).expect("the shipped config template must parse");
+        assert_eq!(
+            config.keybindings.scroll_to_bottom,
+            jcode_config_types::KeybindingsConfig::default().scroll_to_bottom,
+            "the template must list the scroll_to_bottom default"
+        );
         assert_eq!(config.tools.mcp_tools, McpToolsMode::Auto);
         assert_eq!(config.tools.mcp_tools_token_threshold, 8_000);
         assert!(

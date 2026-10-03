@@ -31,6 +31,7 @@ pub mod backend;
 pub(crate) mod color_support;
 mod core;
 pub(crate) mod fuzzy;
+pub mod herdr;
 // Terminal image display + metadata helpers now live in the dependency-free
 // `jcode-terminal-image` crate (shared with the `read` tool). Re-exported here
 // so existing `crate::tui::image` paths keep working.
@@ -78,7 +79,7 @@ pub use crate::generated_image::{
     generated_image_side_panel_markdown, generated_image_side_panel_page_id,
     write_generated_image_side_panel_page,
 };
-pub use app::{App, CopyBadgeUiState, ProcessingStatus, RunResult};
+pub use app::{App, CloudHandoff, CopyBadgeUiState, ProcessingStatus, RunResult};
 
 use crate::message::ToolCall;
 use ratatui::prelude::Frame;
@@ -458,27 +459,17 @@ pub trait TuiState {
     fn terminal_clear_collapsed(&self) -> bool {
         false
     }
+    /// Content-coordinate reading position captured before a resize rewrapped
+    /// the transcript. The renderer resolves it against the frame it is drawing
+    /// so the anchored message stays under the reader.
+    fn pending_resize_anchor(&self) -> Option<jcode_tui_messages::ContentPos> {
+        None
+    }
     /// When older compacted history is being loaded in, this is the reader's
     /// captured distance (in wrapped lines) from the bottom of the transcript.
     /// The renderer uses it to keep the viewport anchored to the same content as
     /// older messages are prepended above, instead of snapping to the new top.
     fn pending_history_anchor_lines_from_bottom(&self) -> Option<usize> {
-        None
-    }
-    /// Whether the elastic overscroll status line (revealed by scrolling past
-    /// the bottom of the transcript) is currently shown.
-    fn chat_overscroll_active(&self) -> bool {
-        false
-    }
-    /// Whether the overscroll status line is pinned permanently visible by
-    /// config (`display.overscroll_status = "on"`). A pinned line is part of
-    /// the stable layout, unlike the transient elastic reveal.
-    fn chat_overscroll_pinned(&self) -> bool {
-        false
-    }
-    /// Seconds remaining in the overscroll dwell window, used to render the
-    /// `(overscroll x.x)` countdown. `None` when not shown.
-    fn chat_overscroll_remaining(&self) -> Option<f32> {
         None
     }
     /// Whether a mouse drag-selection is currently held at the top/bottom edge of
@@ -600,6 +591,11 @@ pub trait TuiState {
     fn connected_clients(&self) -> Option<usize>;
     /// Short-lived notice shown in the status line (e.g., model switch, toggle diff)
     fn status_notice(&self) -> Option<String>;
+    /// Built-in voice input status while recording or transcribing:
+    /// `(recording, text)`. Shown ahead of every other notice.
+    fn voice_input_status(&self) -> Option<(bool, String)> {
+        None
+    }
     /// How long since the user last pressed a key, scrolled, or pasted, or
     /// `None` when they have not interacted yet.
     ///
@@ -632,6 +628,11 @@ pub trait TuiState {
     }
     /// Optional configured keybinding label for external dictation.
     fn dictation_key_label(&self) -> Option<String>;
+    /// Label of the `scroll_to_bottom` chord shown in the "Jump to bottom"
+    /// pill, or `None` when the action is unbound.
+    fn jump_to_bottom_key_label(&self) -> Option<String> {
+        None
+    }
     /// Time since app started (for startup animations)
     fn animation_elapsed(&self) -> f32;
     /// Time remaining until rate limit resets (if rate limited)
@@ -759,6 +760,10 @@ pub trait TuiState {
     /// Session-scoped side panel state managed by the side_panel tool
     // ---- Side panel ----
     fn side_panel(&self) -> &crate::side_panel::SidePanelSnapshot;
+    /// Whether the side panel replaces the transcript (fullscreen mode).
+    fn side_panel_fullscreen(&self) -> bool {
+        false
+    }
     /// Whether to pin read images to a side pane
     fn pin_images(&self) -> bool;
     /// Whether inline transcript images render expanded. When false, each
@@ -833,6 +838,10 @@ pub trait TuiState {
     fn copy_selection_range(&self) -> Option<CopySelectionRange>;
     /// Persistent status for in-app copy selection mode.
     fn copy_selection_status(&self) -> Option<CopySelectionStatus>;
+    /// Editable composer selection as an ordered byte range into `input()`.
+    fn input_selection_range(&self) -> Option<(usize, usize)> {
+        None
+    }
     /// Whether the first-run onboarding empty state is being previewed in this session.
     // ---- Onboarding ----
     fn onboarding_preview_mode(&self) -> bool {
@@ -856,8 +865,38 @@ pub trait TuiState {
     fn suggestion_prompts(&self) -> Vec<(String, String)>;
     /// Cache TTL status - shows whether the prompt cache is warm/cold based on idle time
     fn cache_ttl_status(&self) -> Option<CacheTtlInfo>;
+    /// Read-only reset guidance for the active OpenAI OAuth account.
+    fn openai_reset_hint(&self) -> Option<String> {
+        // SSH sessions may use a different login on the remote host. Local
+        // cached credits cannot establish reset availability for that account.
+        if self.is_processing() || is_ssh_remote() {
+            return None;
+        }
+        let data = self.info_widget_data();
+        let auth_method = data.auth_method;
+        if auth_method != info_widget::AuthMethod::OpenAIOAuth {
+            return None;
+        }
+        let usage = crate::usage::get_openai_usage_sync();
+        // This window's account (its pin), else the default account.
+        let account_label = data
+            .window_account
+            .map(|account| account.label)
+            .or_else(crate::auth::codex::active_account_label);
+        crate::tui::ui::input_ui::openai_reset_status_hint(
+            auth_method,
+            &usage,
+            account_label.as_deref(),
+        )
+    }
     /// Whether the notification line has content to show
     fn has_notification(&self) -> bool {
+        if self.voice_input_status().is_some() {
+            return true;
+        }
+        if self.openai_reset_hint().is_some() {
+            return true;
+        }
         if self.copy_selection_status().is_some() {
             return true;
         }
@@ -1410,10 +1449,26 @@ impl PickerKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccountPickerAction {
-    Switch { provider_id: String, label: String },
-    Add { provider_id: String },
-    Replace { provider_id: String, label: String },
-    OpenCenter { provider_filter: Option<String> },
+    /// Use this saved account in this window (pins the session).
+    Switch {
+        provider_id: String,
+        label: String,
+    },
+    /// Make this saved account the default for new windows.
+    SetDefault {
+        provider_id: String,
+        label: String,
+    },
+    Add {
+        provider_id: String,
+    },
+    Replace {
+        provider_id: String,
+        label: String,
+    },
+    OpenCenter {
+        provider_filter: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1475,9 +1530,44 @@ pub struct InlineInteractiveState {
     pub filter: String,
     /// Preview mode: picker is visible but input stays in main text box
     pub preview: bool,
+    /// Routes an `@provider` scope switched, as (entry index, route the user
+    /// had before). Restored when the scope no longer applies, so a temporary
+    /// filter never changes where a later unscoped selection goes.
+    pub scoped_route_restore: Vec<(usize, usize)>,
+    /// Set while the `/model` picker shows the reasoning-level step for one
+    /// model. The entries are then one row per level, and the model list is
+    /// kept here so Esc can return to it unchanged.
+    pub effort_step: Option<Box<ModelEffortStep>>,
+}
+
+/// Second step of the `/model` picker: choose a reasoning level for `model`.
+#[derive(Debug, Clone)]
+pub struct ModelEffortStep {
+    /// The model row that was picked, with its chosen route selected.
+    pub model: PickerEntry,
+    /// The model list as it was, restored on Esc.
+    pub parent: InlineInteractiveState,
+    /// Opened by the save-default key: Enter saves model + level as the
+    /// default instead of switching.
+    pub save_default: bool,
 }
 
 impl InlineInteractiveState {
+    /// The user picked route `option` for entry `index` by hand. Their choice
+    /// replaces any route a scope switched for it, so clearing the scope
+    /// keeps it instead of restoring the older route. A key press that leaves
+    /// the route where it was (nothing else in scope to move to) is not a
+    /// choice, so the saved route is kept.
+    pub fn choose_route(&mut self, index: usize, option: usize) {
+        if let Some(entry) = self.entries.get_mut(index)
+            && option < entry.options.len()
+            && option != entry.selected_option
+        {
+            entry.selected_option = option;
+            self.scoped_route_restore.retain(|(i, _)| *i != index);
+        }
+    }
+
     pub fn debug_memory_profile(&self) -> serde_json::Value {
         let entries_bytes: usize = self.entries.iter().map(estimate_picker_entry_bytes).sum();
         let filtered_bytes = self.filtered.capacity() * std::mem::size_of::<usize>();
@@ -1502,9 +1592,10 @@ fn estimate_picker_action_bytes(action: &PickerAction) -> usize {
         | PickerAction::AgentModelChoice { .. }
         | PickerAction::SubagentModelChoice { .. }
         | PickerAction::LogoutAll => 0,
-        PickerAction::Account(AccountPickerAction::Switch { provider_id, label }) => {
-            provider_id.capacity() + label.capacity()
-        }
+        PickerAction::Account(
+            AccountPickerAction::Switch { provider_id, label }
+            | AccountPickerAction::SetDefault { provider_id, label },
+        ) => provider_id.capacity() + label.capacity(),
         PickerAction::Account(AccountPickerAction::Add { provider_id }) => provider_id.capacity(),
         PickerAction::Account(AccountPickerAction::Replace { provider_id, label }) => {
             provider_id.capacity() + label.capacity()
@@ -1736,8 +1827,17 @@ impl PickerEntry {
     pub fn account_state_label(&self) -> Option<&'static str> {
         match &self.action {
             PickerAction::Account(AccountPickerAction::Switch { .. }) => {
-                Some(if self.is_current { "active" } else { "saved" })
+                // Scope badge for a saved account row.
+                Some(match self.options.first().map(|o| o.api_method.as_str()) {
+                    Some("pinned · this window") => "pinned · this window",
+                    Some("this window · default") => "this window · default",
+                    Some("this window") => "this window",
+                    Some("default") => "default",
+                    _ if self.is_current => "this window",
+                    _ => "saved",
+                })
             }
+            PickerAction::Account(AccountPickerAction::SetDefault { .. }) => Some("default"),
             PickerAction::Account(AccountPickerAction::Add { .. }) => Some("add"),
             PickerAction::Account(AccountPickerAction::Replace { .. }) => Some("replace"),
             PickerAction::Account(AccountPickerAction::OpenCenter { .. }) => Some("manage"),

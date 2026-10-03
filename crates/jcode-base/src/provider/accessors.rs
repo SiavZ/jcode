@@ -1,13 +1,6 @@
 use super::*;
 
 impl MultiProvider {
-    pub(super) fn claude_provider(&self) -> Option<Arc<dyn Provider>> {
-        self.claude
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
     pub(super) fn anthropic_provider(&self) -> Option<Arc<dyn Provider>> {
         self.anthropic
             .read()
@@ -20,6 +13,17 @@ impl MultiProvider {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Runtime that owns stored accounts of `kind`.
+    pub(super) fn account_runtime(
+        &self,
+        kind: jcode_provider_core::AccountProviderKind,
+    ) -> Option<Arc<dyn Provider>> {
+        match kind {
+            jcode_provider_core::AccountProviderKind::Claude => self.anthropic_provider(),
+            jcode_provider_core::AccountProviderKind::OpenAi => self.openai_provider(),
+        }
     }
 
     pub(super) fn antigravity_provider(&self) -> Option<Arc<dyn Provider>> {
@@ -70,7 +74,7 @@ impl MultiProvider {
     }
 
     pub(super) fn has_claude_runtime(&self) -> bool {
-        self.anthropic_provider().is_some() || self.claude_provider().is_some()
+        self.anthropic_provider().is_some()
     }
 
     pub(super) fn provider_slot_available(&self, provider: ActiveProvider) -> bool {

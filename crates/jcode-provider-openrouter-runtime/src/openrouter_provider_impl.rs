@@ -94,13 +94,45 @@ impl Provider for OpenRouterProvider {
             false
         };
 
-        let api_messages = jcode_provider_openrouter::request::build_chat_messages(
+        let mut api_messages = jcode_provider_openrouter::request::build_chat_messages(
             &effective_messages,
             system,
             allow_reasoning,
             include_reasoning_content,
             allow_image_input,
         );
+
+        // Kimi partial-mode thinking prefill (Moonshot partial mode): append a
+        // final assistant message with `partial: true`, empty `content`, and the
+        // configured seed in `reasoning_content`. The model continues the
+        // seeded thinking instead of starting deliberation from scratch, so a
+        // long-CoT model cannot re-derive a refusal from a clean slate. Opt-in
+        // via named-profile `thinking_prefill` config or the
+        // `JCODE_KIMI_THINKING_PREFILL` env/env-file value; Kimi models only
+        // (or any model when the profile sets `thinking_prefill_non_kimi`),
+        // suppressed on strict-schema endpoints.
+        if let Some(seed) = self
+            .thinking_prefill_seed
+            .as_deref()
+            .filter(|seed| !seed.trim().is_empty())
+            && (Self::is_kimi_model(&model) || self.thinking_prefill_non_kimi)
+            && !strict_openai_schema
+        {
+            let mut partial_message = serde_json::json!({
+                "role": "assistant",
+                "partial": true,
+                "content": "",
+                "reasoning_content": seed,
+            });
+            if let Some(name) = self
+                .thinking_prefill_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+            {
+                partial_message["name"] = serde_json::json!(name);
+            }
+            api_messages.push(partial_message);
+        }
 
         // Build tools in OpenAI format
         let api_tools: Vec<Value> = tools
@@ -335,6 +367,14 @@ impl Provider for OpenRouterProvider {
         }
         if Self::profile_rejects_image_input(self.profile_id.as_deref()) {
             return false;
+        }
+
+        // The catalog already states which modalities each model accepts, so
+        // honour that before falling back to a per-provider guess. Without this
+        // a vision-capable model on the native OpenRouter route is clamped to
+        // text even though the provider advertised image input for it.
+        if self.catalog_declares_image_input(&model_id) {
+            return true;
         }
 
         // Direct OpenAI-compatible local providers such as Ollama and LM Studio
@@ -784,6 +824,9 @@ impl Provider for OpenRouterProvider {
             static_reasoning_config: self.static_reasoning_config.clone(),
             max_tokens: self.max_tokens,
             extra_body: self.extra_body.clone(),
+            thinking_prefill_seed: self.thinking_prefill_seed.clone(),
+            thinking_prefill_name: self.thinking_prefill_name.clone(),
+            thinking_prefill_non_kimi: self.thinking_prefill_non_kimi,
             static_models: self.static_models.clone(),
             static_context_limits: self.static_context_limits.clone(),
             static_image_input_support: self.static_image_input_support.clone(),
@@ -887,4 +930,48 @@ impl OpenRouterProvider {
         // `/models` catalog refreshes (issue #579).
         self.supports_provider_features || self.profile_id.is_none() || self.is_user_named_profile()
     }
+
+    /// Whether the model catalog declares `image` as an accepted input modality
+    /// for this model.
+    ///
+    /// Memory decides whenever it holds an opinion about the model, so a freshly
+    /// fetched catalog is never overruled by a stale copy on disk. Only when
+    /// memory is silent does the persisted catalog answer, and that fallback is
+    /// what makes the first request after startup behave: the in-memory cache is
+    /// initialised empty while the catalog is normally already on disk from the
+    /// previous run, so memory alone would keep clamping images until the first
+    /// refresh completed.
+    ///
+    /// `supports_image_input` is a sync trait method, so the in-memory read uses
+    /// `try_read` rather than awaiting the tokio lock; a busy lock defers to the
+    /// disk copy instead of blocking.
+    pub(crate) fn catalog_declares_image_input(&self, model_id: &str) -> bool {
+        if !self.supports_model_catalog {
+            return false;
+        }
+        if let Ok(cache) = self.models_cache.try_read()
+            && let Some(model) = cache
+                .models
+                .iter()
+                .find(|model| model.id.trim().eq_ignore_ascii_case(model_id))
+        {
+            return declares_image_input(model);
+        }
+        self.load_usable_model_disk_cache_entry()
+            .is_some_and(|entry| {
+                entry
+                    .models
+                    .iter()
+                    .find(|model| model.id.trim().eq_ignore_ascii_case(model_id))
+                    .is_some_and(declares_image_input)
+            })
+    }
+}
+
+/// Whether one catalog entry declares `image` as an accepted input modality.
+fn declares_image_input(model: &jcode_provider_openrouter::ModelInfo) -> bool {
+    model
+        .input
+        .iter()
+        .any(|modality| modality.eq_ignore_ascii_case("image"))
 }

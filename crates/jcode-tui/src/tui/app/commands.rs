@@ -14,12 +14,14 @@ pub(super) use super::commands_review::queue_autojudge_remote;
 pub(super) use super::commands_review::{
     ImproveCommand, ManualSubagentSpec, RefactorCommand, autojudge_status_message,
     autoreview_status_message, build_autojudge_startup_message, build_autoreview_startup_message,
-    build_judge_startup_message, build_review_startup_message, current_feedback_target_session_id,
-    handle_autojudge_command_local, handle_autoreview_command_local, handle_judge_command_local,
-    handle_observe_command, handle_review_command_local, launch_forked_session_local,
-    launch_prompt_in_new_session_local, maybe_trigger_autojudge_local,
-    maybe_trigger_autoreview_local, preferred_one_shot_review_override,
-    prepare_review_spawned_session, queue_review_spawn_remote, reset_current_session,
+    build_judge_startup_message, build_review_startup_message, current_autojudge_model_override,
+    current_autoreview_model_override, current_feedback_target_session_id,
+    current_judge_model_override, current_review_model_override, handle_autojudge_command_local,
+    handle_autoreview_command_local, handle_judge_command_local, handle_observe_command,
+    handle_review_command_local, launch_forked_session_local, launch_prompt_in_new_session_local,
+    maybe_trigger_autojudge_local, maybe_trigger_autoreview_local,
+    preferred_one_shot_review_override, prepare_review_spawned_session, queue_review_spawn_remote,
+    reset_current_session,
 };
 pub(super) use super::todos_view::handle_todos_view_command;
 use super::{App, DisplayMessage, LocalRewindUndoSnapshot, ProcessingStatus};
@@ -146,6 +148,48 @@ pub(super) fn is_auto_poke_connectivity_error(error: &str) -> bool {
     ];
 
     connectivity_markers
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Whether `error` says the provider is temporarily overloaded or failing on
+/// its side: HTTP 5xx (including the non-standard 529 "overloaded"), or the
+/// wording providers use for a busy period ("heavy usage", "try again in a
+/// moment"). The provider answered, so this is not a network problem, but
+/// waiting and resending the same turn usually works.
+///
+/// Permanent failures are never an overload, even when their body happens
+/// to use overload wording (a 404 model-not-found saying "temporarily
+/// unavailable"): the statuses the provider runtime refuses to retry
+/// (400, 401, 402, 403, 404, 405, 406, 422) and model/endpoint mismatches are
+/// rejected before the wording is checked.
+pub(super) fn is_provider_overload_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    let status = lower
+        .find("status:")
+        .map(|idx| lower[idx + "status:".len()..].trim_start())
+        .and_then(|rest| rest.get(..3))
+        .and_then(|code| code.parse::<u16>().ok());
+    if matches!(status, Some(400 | 401 | 402 | 403 | 404 | 405 | 406 | 422))
+        || is_fatal_model_endpoint_error(error)
+    {
+        return false;
+    }
+    let status_5xx = status.is_some_and(|code| (500..=599).contains(&code));
+    status_5xx
+        || [
+            "overloaded",
+            "heavy usage",
+            "temporarily unavailable",
+            "temporary unavailability",
+            "try again in a moment",
+            "server is busy",
+            "at capacity",
+            "capacity constraints",
+            "503 service unavailable",
+            "502 bad gateway",
+            "504 gateway timeout",
+        ]
         .iter()
         .any(|marker| lower.contains(marker))
 }
@@ -366,6 +410,7 @@ pub(super) fn create_transfer_session_from_parent(
     let mut child = crate::session::Session::create(Some(parent_session_id.to_string()), None);
     child.messages.clear();
     child.compaction = compaction;
+    child.system_prompt = parent.system_prompt.clone();
     child.working_dir = parent.working_dir.clone();
     child.model = parent.model.clone();
     child.provider_key = parent.provider_key.clone();
@@ -1660,7 +1705,8 @@ pub(super) fn handle_git_status_completed(app: &mut App, completed: GitStatusCom
 }
 
 pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
-    if handle_subagent_model_command(app, trimmed)
+    if app.handle_side_command(trimmed)
+        || handle_subagent_model_command(app, trimmed)
         || app.handle_hotkeys_command(trimmed)
         || app.handle_terminal_setup_command(trimmed)
         || handle_subagent_command(app, trimmed)
@@ -1683,6 +1729,12 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
+    if super::commands_cloud::parse_cloud_command(trimmed).is_some() {
+        let session_id = active_session_id(app);
+        super::commands_cloud::handle_cloud_command(app, trimmed, &session_id);
+        return true;
+    }
+
     if trimmed == "/commit" {
         handle_commit_command_local(app);
         return true;
@@ -1690,6 +1742,11 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
 
     if trimmed == "/merge" {
         handle_merge_command_local(app);
+        return true;
+    }
+
+    if trimmed == "/merge-remote-release" {
+        handle_merge_remote_release_command_local(app);
         return true;
     }
 
@@ -2177,6 +2234,25 @@ pub(super) fn build_merge_prompt() -> String {
     )
 }
 
+pub(super) fn build_merge_remote_release_prompt() -> String {
+    format!(
+        "Merge the current branch and then cut a remote release from the destination branch. Execute these two phases in order. \
+        Phase 1 (merge only, no push or release): {} \
+        Gate: proceed to Phase 2 only after Phase 1 successfully merges the source and all post-merge validation passes, \
+        HEAD is attached to the selected destination, the worktree is clean, and the recorded source commit is an ancestor of HEAD. \
+        If Phase 1 stops for any reason (including already being on the destination branch), has conflicts, fails validation, \
+        or needs clarification, stop the entire workflow without pushing, tagging, or releasing. \
+        The no-push rule and nothing-pushed report above apply to Phase 1 only. \
+        Phase 2 (remote release): stay on the verified destination branch and release its merged HEAD, never the original feature branch. \
+        Do not auto-commit any unexpected work that appears between phases. Stop if the destination branch or HEAD changes unexpectedly. \
+        Stop on any push failure before creating a tag or triggering a release. {} \
+        Finally report the merge source and destination, validation results, release version, push result, and remote release status. \
+        Distinguish a triggered remote workflow from a completed publication.",
+        build_merge_prompt(),
+        build_remote_release_prompt(),
+    )
+}
+
 pub(super) fn build_commit_prompt() -> String {
     "Make interactive, logical commits for the current uncommitted work. Inspect the git state first, including unstaged and staged changes. Group related changes into small coherent commits, staging only the files or hunks that belong together. Preserve unrelated user or agent work, do not discard changes, and do not amend existing commits unless clearly necessary. For each commit, use a concise conventional-style message when possible. Validate as appropriate for the changed files before committing, and report the commits created plus any remaining uncommitted changes.".to_string()
 }
@@ -2324,6 +2400,14 @@ pub(super) fn fast_macos_release_launch_notice(interrupted: bool) -> String {
     }
 }
 
+pub(super) fn merge_remote_release_launch_notice(interrupted: bool) -> String {
+    if interrupted {
+        "👉 Interrupting and starting merge + push + remote release...".to_string()
+    } else {
+        "🚀 Starting merge + push + remote release...".to_string()
+    }
+}
+
 pub(super) fn remote_release_launch_notice(interrupted: bool) -> String {
     if interrupted {
         "👉 Interrupting and starting logical commits + push + remote release...".to_string()
@@ -2388,6 +2472,23 @@ fn handle_fast_macos_release_command_local(app: &mut App) {
         );
     } else {
         app.push_display_message(DisplayMessage::system(fast_macos_release_launch_notice(
+            false,
+        )));
+        super::commands_improve::start_synthetic_user_turn(app, prompt);
+    }
+}
+
+fn handle_merge_remote_release_command_local(app: &mut App) {
+    let prompt = build_merge_remote_release_prompt();
+    if app.is_processing {
+        super::commands_improve::interrupt_and_queue_synthetic_message(
+            app,
+            prompt,
+            "Interrupting for /merge-remote-release...",
+            merge_remote_release_launch_notice(true),
+        );
+    } else {
+        app.push_display_message(DisplayMessage::system(merge_remote_release_launch_notice(
             false,
         )));
         super::commands_improve::start_synthetic_user_turn(app, prompt);
@@ -2807,6 +2908,18 @@ pub(super) fn active_working_dir(app: &App) -> Option<std::path::PathBuf> {
 }
 
 pub(super) fn handle_dictation_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed == "/voice" {
+        app.toggle_voice_input();
+        return true;
+    }
+    if trimmed.starts_with("/voice ") {
+        let key = app.voice_input_key_label().unwrap_or("unbound").to_string();
+        app.push_display_message(DisplayMessage::error(format!(
+            "Usage: /voice (or {key}) starts recording, run it again to send, Esc cancels.\n\
+             Needs a Nari API key (NARI_API_KEY or ~/.config/jcode/nari.env)."
+        )));
+        return true;
+    }
     if trimmed == "/dictate" || trimmed == "/dictation" {
         app.handle_dictation_trigger();
         return true;
@@ -3226,6 +3339,12 @@ pub(super) fn handle_agents_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     let rest = trimmed.strip_prefix("/agents").unwrap_or_default().trim();
+    let (global, rest) = match rest.split_once(' ') {
+        Some(("global" | "default", tail)) => (true, tail.trim()),
+        _ if matches!(rest, "global" | "default") => (true, ""),
+        _ => (false, rest),
+    };
+    app.agent_models_global_scope = global;
     if rest.is_empty() {
         app.open_agents_picker();
         return true;
@@ -3233,7 +3352,7 @@ pub(super) fn handle_agents_command(app: &mut App, trimmed: &str) -> bool {
 
     let Some(target) = parse_agents_target(rest) else {
         app.push_display_message(DisplayMessage::error(
-            "Usage: /agents or /agents <swarm|review|judge|memory|ambient>".to_string(),
+            "Usage: /agents [default|global] [swarm|review|judge|memory|ambient]".to_string(),
         ));
         return true;
     };

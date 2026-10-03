@@ -41,7 +41,7 @@ pub fn known_providers() -> Vec<String> {
     KNOWN_PROVIDERS.iter().map(|p| (*p).to_string()).collect()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
     #[serde(default)]
@@ -51,6 +51,11 @@ pub struct ModelInfo {
     pub pricing: ModelPricing,
     #[serde(default)]
     pub created: Option<u64>,
+    /// Declared input modalities, e.g. `["text", "image"]`. Empty when the
+    /// catalog did not say, in which case callers keep their existing default
+    /// rather than inferring a capability the source never claimed.
+    #[serde(default)]
+    pub input: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -717,7 +722,10 @@ pub fn parse_provider_routing_from_env() -> ProviderRouting {
 
 pub fn is_kimi_model(model: &str) -> bool {
     let lower = model.to_lowercase();
-    lower.contains("moonshotai/") || lower.contains("kimi-k2") || lower.contains("kimi-k2.5")
+    lower.contains("moonshotai/")
+        || lower.contains("kimi-k2")
+        || lower.contains("kimi-k2.5")
+        || lower.contains("kimi-k3")
 }
 
 pub fn rank_providers_from_endpoints(endpoints: &[EndpointInfo]) -> Vec<String> {

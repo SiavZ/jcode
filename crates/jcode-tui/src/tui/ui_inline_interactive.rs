@@ -87,11 +87,11 @@ fn picker_entry_display_name(entry: &crate::tui::PickerEntry) -> String {
 /// Human-friendly rendering of a model picker row's model name.
 ///
 /// `/model` rows historically showed the raw provider model id
-/// (`claude-opus-4-8`, `gpt-5.5 (high)`), which reads worse than the pretty
-/// names every other surface uses (header, status line, info widgets). We
-/// prettify only the well-known families so unfamiliar or namespaced ids
-/// (OpenRouter `vendor/model`, local profiles) keep their exact spelling and
-/// stay copy-pasteable. Effort suffixes such as ` (high)` are preserved.
+/// (`claude-opus-4-8`), which reads worse than the pretty names every other
+/// surface uses (header, status line, info widgets). We prettify only the
+/// well-known families so unfamiliar or namespaced ids (OpenRouter
+/// `vendor/model`, local profiles) keep their exact spelling and stay
+/// copy-pasteable.
 fn picker_entry_pretty_name(entry: &crate::tui::PickerEntry) -> String {
     if !matches!(
         entry.action,
@@ -99,17 +99,8 @@ fn picker_entry_pretty_name(entry: &crate::tui::PickerEntry) -> String {
     ) {
         return entry.name.clone();
     }
-    let (base, suffix) = match entry.effort.as_deref() {
-        Some(_) => match entry.name.rsplit_once(" (") {
-            Some((base, rest)) => (base, format!(" ({rest}")),
-            None => (entry.name.as_str(), String::new()),
-        },
-        None => (entry.name.as_str(), String::new()),
-    };
-    match crate::tui::app::helpers::model_names::pretty_known_model_family(base) {
-        Some(pretty) => format!("{pretty}{suffix}"),
-        None => entry.name.clone(),
-    }
+    crate::tui::app::helpers::model_names::pretty_known_model_family(&entry.name)
+        .unwrap_or_else(|| entry.name.clone())
 }
 
 fn picker_row_marker(is_row_selected: bool, unavailable: bool, limited: bool) -> &'static str {
@@ -353,6 +344,89 @@ fn fuzzy_match_positions(pattern: &str, text: &str) -> Vec<usize> {
     jcode_fuzzy::fuzzy_match_token_positions(pattern, text)
 }
 
+/// Rows the focused `/model` browser may use (the as-you-type preview keeps
+/// the command-suggestion limit).
+const MODEL_BROWSER_VISIBLE_LIMIT: usize = 16;
+
+/// The reasoning-level step of `/model`: a header naming the model and route,
+/// then one row per level.
+fn model_effort_step_lines(
+    picker: &crate::tui::InlineInteractiveState,
+    step: &crate::tui::ModelEffortStep,
+    available_rows: usize,
+) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(dim_color());
+    let accent = Style::default().fg(rgb(255, 213, 128));
+    let mut lines = Vec::new();
+    let mut header = vec![
+        Span::styled(
+            if step.save_default {
+                "Default reasoning for "
+            } else {
+                "Reasoning for "
+            },
+            dim,
+        ),
+        Span::styled(picker_entry_pretty_name(&step.model), accent),
+    ];
+    if let Some(route) = step.model.active_option() {
+        header.push(Span::styled(
+            format!(
+                "  via {} · {}",
+                route_provider_display(&route.provider, &route.api_method),
+                api_method_display(&route.api_method)
+            ),
+            dim,
+        ));
+    }
+    lines.push(Line::from(header));
+    let hint_rows = usize::from(available_rows > 2);
+    let visible = available_rows
+        .saturating_sub(1 + hint_rows)
+        .min(picker.filtered.len());
+    if visible == 0 {
+        lines.truncate(available_rows);
+        return lines;
+    }
+    let selected = picker.selected.min(picker.filtered.len() - 1);
+    let start = selected.saturating_sub(visible - 1);
+    for row in start..start + visible {
+        let entry = &picker.entries[picker.filtered[row]];
+        let style = if row == selected {
+            accent
+        } else {
+            Style::default().fg(rgb(128, 203, 196))
+        };
+        let mut spans = vec![Span::styled(
+            format!(
+                "{} {}",
+                picker_row_marker(row == selected, false, false),
+                entry.name
+            ),
+            style,
+        )];
+        if entry.is_current {
+            spans.push(Span::styled(" current", dim));
+        }
+        if entry.recommended {
+            spans.push(Span::styled(" ★", dim));
+        }
+        lines.push(Line::from(spans));
+    }
+    if hint_rows > 0 {
+        let confirm = if step.save_default {
+            "Enter save default"
+        } else {
+            "Enter switch"
+        };
+        lines.push(Line::from(Span::styled(
+            format!("↑↓ level · {confirm} · Esc back to models"),
+            dim,
+        )));
+    }
+    lines
+}
+
 /// Compact, borderless model choices for the command-suggestion surface.
 /// Uses the existing picker state so filtering, routes and hotkeys are unchanged.
 pub(super) fn model_suggestion_lines(
@@ -362,14 +436,55 @@ pub(super) fn model_suggestion_lines(
     if available_rows == 0 {
         return Vec::new();
     }
+    if let Some(step) = picker.effort_step.as_deref() {
+        return model_effort_step_lines(picker, step, available_rows);
+    }
     let dim = Style::default().fg(dim_color());
+    // The focused browser (bare `/model` + Enter) owns typing, so show its
+    // search box and provider scope above the list.
+    let browsing = !picker.preview
+        && picker
+            .entries
+            .iter()
+            .any(|entry| matches!(entry.action, crate::tui::PickerAction::Model));
+    let mut search_line = None;
+    if browsing {
+        let (_, search) = crate::tui::app::split_model_picker_filter(&picker.filter);
+        let provider = crate::tui::app::model_picker_active_provider(picker)
+            .unwrap_or_else(|| "all providers".to_string());
+        let accent = Style::default().fg(rgb(255, 213, 128));
+        let mut spans = vec![
+            Span::styled("Search: ", dim),
+            Span::styled(format!("{search}▏"), accent),
+            Span::styled("  Provider: ", dim),
+            Span::styled(provider, accent),
+            Span::styled(
+                format!("  ({}/{})", picker.filtered.len(), picker.entries.len()),
+                dim,
+            ),
+        ];
+        if search.is_empty() {
+            spans.insert(1, Span::styled("type to filter ", dim.italic()));
+        }
+        search_line = Some(Line::from(spans));
+    }
+    let search_rows = usize::from(search_line.is_some() && available_rows > 1);
+    let available_rows = available_rows - search_rows;
     if picker.filtered.is_empty() {
         let message = if picker.filter.is_empty() {
             "No matching models".to_string()
         } else {
             format!("No matching models for {}", picker.filter)
         };
-        return vec![Line::from(Span::styled(message, dim))];
+        let mut lines: Vec<Line<'static>> = search_line.into_iter().take(search_rows).collect();
+        lines.push(Line::from(Span::styled(message, dim)));
+        if browsing && available_rows > 1 {
+            lines.push(Line::from(Span::styled(
+                "Backspace edit search · Ctrl+P next provider · Esc clear",
+                dim,
+            )));
+        }
+        return lines;
     }
     let selected = picker.selected.min(picker.filtered.len() - 1);
     let selected_entry = &picker.entries[picker.filtered[selected]];
@@ -377,11 +492,42 @@ pub(super) fn model_suggestion_lines(
     let hint = model_picker_top_hint(picker);
     let hint_rows = usize::from(available_rows > 1);
     let notice_rows = usize::from(notice.is_some() && available_rows > hint_rows + 1);
-    let visible = crate::tui::app::COMMAND_SUGGESTION_VISIBLE_LIMIT
+    let visible_limit = if browsing {
+        MODEL_BROWSER_VISIBLE_LIMIT
+    } else {
+        crate::tui::app::COMMAND_SUGGESTION_VISIBLE_LIMIT
+    };
+    let visible = visible_limit
         .min(available_rows - hint_rows - notice_rows)
         .min(picker.filtered.len());
     let start = selected.saturating_sub(visible - 1);
+    // Measure the visible rows, not the whole catalog: offscreen long names
+    // should not push the provider and method out of the suggestion surface.
+    let mut model_width = 0;
+    let mut provider_width = 0;
+    for &index in &picker.filtered[start..start + visible] {
+        let entry = &picker.entries[index];
+        model_width = model_width.max(
+            display_width(&picker_entry_display_name(entry))
+                + if entry.is_current {
+                    " current".len()
+                } else {
+                    0
+                },
+        );
+        if let Some(route) = entry.active_option() {
+            provider_width = provider_width.max(display_width(&route_provider_display(
+                &route.provider,
+                &route.api_method,
+            )));
+        }
+    }
     let mut lines = Vec::new();
+    if search_rows > 0
+        && let Some(line) = search_line
+    {
+        lines.push(line);
+    }
     for row in start..start + visible {
         let entry = &picker.entries[picker.filtered[row]];
         let route = entry.active_option();
@@ -405,10 +551,20 @@ pub(super) fn model_suggestion_lines(
         }
         if let Some(route) = route {
             let route_style = if row == selected { style } else { dim };
+            let name_width = display_width(&picker_entry_display_name(entry))
+                + if entry.is_current {
+                    " current".len()
+                } else {
+                    0
+                };
+            spans.push(Span::raw(" ".repeat(model_width - name_width)));
             spans.push(Span::styled(
                 format!(
                     "  {}",
-                    route_provider_display(&route.provider, &route.api_method)
+                    pad_left_display(
+                        &route_provider_display(&route.provider, &route.api_method),
+                        provider_width,
+                    )
                 ),
                 if row == selected && !picker.preview && picker.column == 1 {
                     route_style.bold().underlined()
@@ -441,13 +597,22 @@ pub(super) fn model_suggestion_lines(
         lines.push(Line::from(Span::styled(notice.unwrap().0, dim)));
     }
     if hint_rows > 0 {
-        let filter = if !picker.preview && !picker.filter.is_empty() {
+        let filter = if !browsing && !picker.preview && !picker.filter.is_empty() {
             format!("Filter: {} · ", picker.filter)
         } else {
             String::new()
         };
         let navigation = if !picker.preview && picker.column > 0 {
             "↑↓ route · ←→ column · Enter select · Esc cancel"
+        } else if browsing {
+            "↑↓ scroll · type to search · Ctrl+P provider · Enter select · Esc"
+        } else if picker.preview
+            && picker
+                .entries
+                .iter()
+                .any(|entry| matches!(entry.action, crate::tui::PickerAction::Model))
+        {
+            "↑↓ choose · Enter select · Ctrl+P provider · Esc cancel"
         } else {
             "↑↓ choose · Enter select · Esc cancel"
         };
@@ -1006,6 +1171,8 @@ mod tests {
             column: 0,
             filter: String::new(),
             preview: false,
+            scoped_route_restore: Vec::new(),
+            effort_step: None,
             entries: vec![crate::tui::PickerEntry {
                 name: "gpt-5.4".to_string(),
                 options: vec![crate::tui::PickerOption {
@@ -1028,6 +1195,70 @@ mod tests {
                 effort: None,
             }],
         }
+    }
+
+    #[test]
+    fn model_suggestions_align_provider_and_method_columns() {
+        let mut picker = sample_picker();
+        picker.entries[0].is_default = true;
+        let mut other = picker.entries[0].clone();
+        other.name = "模型 (minimal)".into();
+        other.is_current = false;
+        other.is_default = false;
+        other.recommended = false;
+        other.created_date = Some("Sep 2026".into());
+        other.options[0].provider = "Anthropic".into();
+        other.options[0].api_method = "openai-api-key".into();
+        picker.entries.push(other);
+        picker.filtered.push(1);
+        for preview in [false, true] {
+            picker.preview = preview;
+            let lines = model_suggestion_lines(&picker, 4);
+            // The focused browser starts with its search row.
+            let texts: Vec<String> = lines
+                .iter()
+                .skip(usize::from(!preview))
+                .take(2)
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect()
+                })
+                .collect();
+            let column = |row: usize, label: &str| {
+                display_width(&texts[row][..texts[row].find(label).unwrap()])
+            };
+            assert_eq!(column(0, "openai"), column(1, "Anthropic"));
+            assert_eq!(column(0, "oauth"), column(1, "api key"));
+            assert!(texts[0].contains("default current"));
+            assert!(texts[1].contains("Sep 2026"));
+        }
+    }
+
+    #[test]
+    fn model_suggestions_measure_only_visible_filtered_rows() {
+        let mut picker = sample_picker();
+        let mut hidden = picker.entries[0].clone();
+        hidden.name = "x".repeat(200);
+        hidden.options[0].provider = "y".repeat(200);
+        picker.entries.push(hidden);
+        let baseline = model_suggestion_lines(&picker, 1);
+        picker.filtered.push(1);
+        let lines = model_suggestion_lines(&picker, 1);
+        // The only difference is the remaining-results indicator.
+        assert_eq!(
+            lines[0].spans[..lines[0].spans.len() - 1],
+            baseline[0].spans
+        );
+        picker.filtered = vec![1, 0];
+        picker.selected = 1;
+        let scrolled = model_suggestion_lines(&picker, 1);
+        assert_eq!(
+            scrolled[0].spans[..scrolled[0].spans.len() - 1],
+            baseline[0].spans
+        );
+        assert!(model_suggestion_lines(&picker, 0).is_empty());
     }
 
     fn sample_account_picker(mixed_providers: bool) -> crate::tui::InlineInteractiveState {
@@ -1092,6 +1323,8 @@ mod tests {
             column: 0,
             filter: String::new(),
             preview: false,
+            scoped_route_restore: Vec::new(),
+            effort_step: None,
             entries: models,
         }
     }
@@ -1104,6 +1337,8 @@ mod tests {
             column: 0,
             filter: String::new(),
             preview: false,
+            scoped_route_restore: Vec::new(),
+            effort_step: None,
             entries: vec![crate::tui::PickerEntry {
                 name: "Swarm / subagent".to_string(),
                 options: vec![crate::tui::PickerOption {
@@ -1306,9 +1541,8 @@ mod tests {
         entry.name = "claude-opus-4-8".to_string();
         assert_eq!(picker_entry_display_name(entry), "Claude Opus 4.8");
 
-        entry.name = "gpt-5.5 (high)".to_string();
-        entry.effort = Some("high".to_string());
-        assert_eq!(picker_entry_display_name(entry), "GPT-5.5 (high)");
+        entry.name = "gpt-5.5".to_string();
+        assert_eq!(picker_entry_display_name(entry), "GPT-5.5");
     }
 
     #[test]

@@ -9,6 +9,15 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 # that shim and resolve the real Cargo binary.
 export JCODE_IN_DEV_CARGO=1
 
+# Agent builds routinely saturate every core. At equal priority they starve
+# interactive UI threads (Jcode Desktop measured 100-260 ms input latency
+# during parallel test builds). Lower this build's priority once, inherited by
+# Cargo and every rustc child. Set JCODE_CARGO_NICE=0 to opt out.
+if [[ -z "${JCODE_CARGO_NICED:-}" ]]; then
+  export JCODE_CARGO_NICED=1
+  renice -n "${JCODE_CARGO_NICE:-10}" -p $$ >/dev/null 2>&1 || true
+fi
+
 # The exported BashTool shim survives `cd` and child shells. Do not redirect
 # Cargo back here when the caller has moved to a different checkout. Compare
 # physical paths so entering this checkout through a symlink still works.
@@ -42,9 +51,23 @@ start_rust_action_log() {
   local state_root="${JCODE_HOME:-${HOME:+$HOME/.jcode}}"
   [[ -n "$state_root" ]] || state_root="$repo_root/target/jcode-state"
   rust_action_log_path="${JCODE_RUST_ACTION_LOG_PATH:-$state_root/logs/rust-actions.jsonl}"
-  rust_action_log_started_ns=$(date +%s%N)
+  rust_action_log_started_ns=$(now_ns)
   rust_action_log_started_at=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
-  trap 'record_rust_action_log "$?"' EXIT
+  # Re-raise the original status after logging. Returning from an EXIT trap
+  # is not enough on bash 3.2: after a failed special builtin the trap's own
+  # status becomes the script's exit status.
+  trap 'rust_action_exit=$?; record_rust_action_log "$rust_action_exit"; exit "$rust_action_exit"' EXIT
+}
+
+# Nanoseconds since the epoch. BSD `date` (macOS) has no %N and prints it
+# literally, which breaks the arithmetic below.
+now_ns() {
+  local ns
+  ns=$(date +%s%N)
+  case "$ns" in
+    *N) python3 -c 'import time; print(time.time_ns())' 2>/dev/null || echo "$(date +%s)000000000" ;;
+    *) echo "$ns" ;;
+  esac
 }
 
 record_rust_action_log() {
@@ -53,7 +76,7 @@ record_rust_action_log() {
   trap - EXIT
 
   local finished_ns duration_ms profile action
-  finished_ns=$(date +%s%N)
+  finished_ns=$(now_ns)
   duration_ms=$(( (finished_ns - rust_action_log_started_ns) / 1000000 ))
   profile=$(selected_profile "${cargo_argv[@]}")
   action="${cargo_argv[0]:-unknown}"
@@ -593,115 +616,57 @@ maybe_configure_low_memory_selfdev() {
   log "using low-memory selfdev overrides (${selfdev_low_memory_status#enabled:})"
 }
 
-# Enable rustc's parallel front-end (`-Zthreads`) for iterative dev/selfdev/test
-# builds. The jcode monoliths (jcode-base/app-core/tui) are ~80% single-threaded
-# front-end (type-check + borrow-check + monomorphization collection); at
-# opt-level 0 that front-end, not codegen, dominates wall time. The parallel
-# front-end is a nightly-only `-Z` flag, so this is gated on a nightly toolchain
-# being available and only applies to the unoptimized iteration profiles.
+# Enable rustc's parallel front-end (`-Zthreads`) for the unoptimized
+# iteration profiles (dev/selfdev/test). The jcode monoliths spend most of an
+# opt-level 0 compile in the single-threaded front-end (type/borrow checking),
+# so extra front-end threads are the highest-leverage compile-time lever.
 #
-# Measured on this repo (Intel Ultra 7, 8 logical cores, selfdev profile):
-#   jcode-base clean recompile  25.3s -> 12.7s   (-Zthreads=4)
-#   base-edit full-chain rebuild  ~16s -> ~10s
-# Cranelift was tried too and was *slower* here (16.5s) because the bottleneck is
-# the front-end, not codegen, so we deliberately do not enable it.
+# Measured on a 16-thread Intel Core Ultra X9 388H, full re-check of one crate:
+#   jcode-base      29.3s -> 8.8s   (-Zthreads=8, +0.08 GiB RSS)
+#   jcode-app-core  25.7s -> 8.9s   (-Zthreads=8, +0.2 GiB RSS)
+#
+# This is applied through Cargo's RUSTC_WRAPPER
+# (scripts/rustc-parallel-frontend), not RUSTFLAGS or RUSTC_WORKSPACE_WRAPPER:
+#   - only local crates (sources outside CARGO_HOME) get the flag, so registry
+#     and git dependency artifacts are untouched;
+#   - RUSTC_WRAPPER is not hashed into crate metadata or fingerprints, so raw
+#     `cargo` (rust-analyzer, CI) and wrapped builds share the same artifacts;
+#   - it works on the stable toolchain (the wrapper sets RUSTC_BOOTSTRAP=1 for
+#     those rustc invocations only), so no nightly install is required;
+#   - optimized compiles (release/release-lto/publish) are passed through.
+# Keep it stable between builds: rustc's incremental cache is keyed on the
+# flags, so flipping it recompiles the affected crates once.
 #
 # Controls:
-#   JCODE_PARALLEL_FRONTEND=auto|0|1   (default auto)
-#   JCODE_FRONTEND_THREADS=<n>         (default 4; diminishing returns past 4)
-#   JCODE_DEV_TOOLCHAIN=<name>         (default: nightly when present)
+#   JCODE_PARALLEL_FRONTEND=auto|0     (default auto = on for dev/selfdev/test)
+#   JCODE_FRONTEND_THREADS=<n>         (default min(8, CPUs))
 parallel_frontend_status="disabled"
-parallel_frontend_toolchain=""
-
-dev_nightly_toolchain() {
-  # Prefer an explicit override, else a `+toolchain` already on the argv, else
-  # the first installed nightly toolchain.
-  if [[ -n "${JCODE_DEV_TOOLCHAIN:-}" ]]; then
-    printf '%s\n' "$JCODE_DEV_TOOLCHAIN"
-    return 0
-  fi
-  local tc
-  tc=$(rustup toolchain list 2>/dev/null | awk '/^nightly/ {print $1; exit}')
-  tc=${tc%% *}
-  [[ -n "$tc" ]] && printf '%s\n' "$tc"
-  return 0
-}
 
 configure_parallel_frontend() {
-  local requested="${JCODE_PARALLEL_FRONTEND:-auto}"
-  local forced="false"
-  case "$requested" in
-    0|false|no|off)
-      parallel_frontend_status="disabled-by-env"
-      return 0
-      ;;
-    1|true|yes|on|force) forced="true" ;;
-    auto) ;;
-    *)
-      parallel_frontend_status="disabled-bad-env:${requested}"
-      return 0
-      ;;
-  esac
-
-  # Only worth it for the unoptimized iteration profiles where the front-end is
-  # the bottleneck; release/release-lto keep their own (codegen-bound) path.
-  #
-  # By default (`auto`) we restrict to the `selfdev` profile: it builds into the
-  # isolated `target/selfdev` dir that only this script + `selfdev build` use, so
-  # adding `-Zthreads` to RUSTFLAGS (which changes cargo's unit fingerprint)
-  # cannot thrash rust-analyzer's `target/debug` cache. Forcing the flag on
-  # (`JCODE_PARALLEL_FRONTEND=1`) opts dev/test in too, accepting that potential
-  # cache contention.
   local profile
   profile=$(selected_profile "$@")
   case "$profile" in
-    selfdev) ;;
-    dev|test)
-      if [[ "$forced" != "true" ]]; then
-        parallel_frontend_status="skipped-profile-shared-target:${profile}"
-        return 0
-      fi
-      ;;
+    dev|selfdev|test) ;;
     *)
       parallel_frontend_status="skipped-profile:${profile}"
       return 0
       ;;
   esac
 
-  # If the caller already pinned a toolchain via `cargo +foo`, don't override it.
-  for arg in "$@"; do
-    case "$arg" in
-      +*)
-        parallel_frontend_status="skipped-explicit-toolchain:${arg}"
-        return 0
-        ;;
-    esac
-  done
-
-  command -v rustup >/dev/null 2>&1 || {
-    parallel_frontend_status="skipped-no-rustup"
-    return 0
-  }
-  local tc
-  tc=$(dev_nightly_toolchain)
-  if [[ -z "$tc" ]]; then
-    parallel_frontend_status="skipped-no-nightly"
-    return 0
-  fi
-  # Confirm the toolchain actually resolves (installed, not just configured).
-  if ! rustup run "$tc" rustc --version >/dev/null 2>&1; then
-    parallel_frontend_status="skipped-nightly-unavailable:${tc}"
+  if [[ -n "${RUSTC_WRAPPER:-}" ]]; then
+    parallel_frontend_status="skipped-external-rustc-wrapper:${RUSTC_WRAPPER}"
     return 0
   fi
 
-  local threads="${JCODE_FRONTEND_THREADS:-4}"
-  [[ "$threads" =~ ^[0-9]+$ && "$threads" -ge 1 ]] || threads=4
-
-  parallel_frontend_toolchain="$tc"
-  export RUSTUP_TOOLCHAIN="$tc"
-  append_rustflags "-Zthreads=${threads}"
-  parallel_frontend_status="enabled:${tc}:threads=${threads}"
-  log "using parallel rustc front-end (${tc}, -Zthreads=${threads})"
+  export RUSTC_WRAPPER="$repo_root/scripts/rustc-parallel-frontend"
+  case "${JCODE_PARALLEL_FRONTEND:-auto}" in
+    0|false|no|off)
+      parallel_frontend_status="disabled-by-env:wrapper-passthrough"
+      return 0
+      ;;
+  esac
+  parallel_frontend_status="enabled:rustc-wrapper:threads=${JCODE_FRONTEND_THREADS:-auto}"
+  log "using parallel rustc front-end for local crates (-Zthreads=${JCODE_FRONTEND_THREADS:-auto})"
 }
 
 configure_linux_linker() {
@@ -1076,10 +1041,14 @@ acquire_cargo_gate() {
   gate_dir="${JCODE_CARGO_GATE_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}}"
   mkdir -p "$gate_dir"
   gate_path="${JCODE_CARGO_GATE_PATH:-$gate_dir/jcode-cargo-build.lock}"
-  exec {cargo_gate_fd}>"$gate_path"
+  # A fixed descriptor instead of `exec {var}>`: that form needs bash 4.1, and
+  # on macOS's bash 3.2 it fails in a way that exits the script with status 0,
+  # so every build silently "succeeded" without compiling anything.
+  cargo_gate_fd=9
+  exec 9>"$gate_path"
   if ! flock -n "$cargo_gate_fd"; then
     log "waiting for the host-wide Cargo gate ($gate_path)"
-    wait_started_ns=$(date +%s%N)
+    wait_started_ns=$(now_ns)
     waited_seconds=0
     # Avoid one silent, unbounded flock call. Periodic notes make it clear that
     # the process is alive and blocked behind another compiler rather than hung.
@@ -1087,7 +1056,7 @@ acquire_cargo_gate() {
       waited_seconds=$((waited_seconds + 30))
       log "still waiting for the host-wide Cargo gate (${waited_seconds}s elapsed)"
     done
-    wait_finished_ns=$(date +%s%N)
+    wait_finished_ns=$(now_ns)
     cargo_gate_wait_ms=$(( (wait_finished_ns - wait_started_ns) / 1000000 ))
   fi
   export JCODE_CARGO_GATE_HELD=1

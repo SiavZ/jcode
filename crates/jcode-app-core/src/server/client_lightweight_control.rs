@@ -1,9 +1,12 @@
-use super::client_actions::{NotifySessionContext, handle_notify_session};
+use super::client_actions::{
+    NotifySessionContext, handle_applet_action, handle_close_applet, handle_notify_session,
+};
 use super::client_comm::{
     handle_comm_channel_members, handle_comm_list, handle_comm_list_channels, handle_comm_message,
     handle_comm_read, handle_comm_share, handle_comm_subscribe_channel,
     handle_comm_unsubscribe_channel,
 };
+use super::client_comm_swarms::{handle_comm_list_swarms, handle_comm_set_swarm_label};
 use super::client_writer::write_direct_event;
 use super::comm_await::{CommAwaitMembersContext, handle_comm_await_members};
 use super::comm_control::{
@@ -47,6 +50,7 @@ pub(super) fn parse_swarm_spawn_mode(
                         "Invalid spawn_mode '{value}'. Expected one of: visible, headless, inline, auto"
                     ),
                     retry_after_secs: None,
+                    server_resumes: false,
                 });
                 None
             }
@@ -109,13 +113,19 @@ pub(super) async fn handle_lightweight_control_request(
             &ServerEvent::Pong {
                 id,
                 native_ssh_protocol: Some(1),
+                capabilities: vec!["session_tools".into()],
             },
         )
         .await?;
         return Ok(());
     }
 
-    write_direct_event(&writer, &ServerEvent::Ack { id: request.id() }).await?;
+    let ack = write_direct_event(&writer, &ServerEvent::Ack { id: request.id() }).await;
+    // A fire-and-forget auth notice (SDK login flow) may hang up right after
+    // writing. The credential change must still be applied.
+    if !matches!(request, Request::NotifyAuthChanged { .. }) {
+        ack?;
+    }
 
     let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel::<ServerEvent>();
     let writer_clone = Arc::clone(&writer);
@@ -137,6 +147,35 @@ pub(super) async fn handle_lightweight_control_request(
     match request {
         // Scheduled delivery opens a one-shot connection and names the target
         // session explicitly. Reuse its live agent, not a new subscribed agent.
+        Request::InvalidateOpenAiUsage { id, account_label } => {
+            super::provider_control::handle_invalidate_openai_usage(
+                id,
+                account_label,
+                &client_event_tx,
+            )
+            .await;
+        }
+        Request::InvalidateAnthropicUsage { id, account_label } => {
+            super::provider_control::handle_invalidate_anthropic_usage(
+                id,
+                account_label,
+                &client_event_tx,
+            )
+            .await;
+        }
+        Request::NotifyAuthChanged {
+            id, provider, auth, ..
+        } => {
+            super::provider_control::handle_notify_auth_changed_process_wide(
+                id,
+                provider,
+                auth,
+                provider_template,
+                sessions,
+                &client_event_tx,
+            )
+            .await;
+        }
         Request::NotifySession {
             id,
             session_id,
@@ -159,6 +198,42 @@ pub(super) async fn handle_lightweight_control_request(
                 },
             )
             .await;
+        }
+        Request::AppletAction {
+            id,
+            session_id,
+            instance,
+            action,
+            state,
+            source_key,
+        } => {
+            handle_applet_action(
+                id,
+                session_id,
+                instance,
+                action,
+                state,
+                source_key,
+                NotifySessionContext {
+                    sessions,
+                    soft_interrupt_queues,
+                    client_connections,
+                    swarm_members,
+                    swarms_by_id,
+                    event_history,
+                    event_counter,
+                    swarm_event_tx,
+                    client_event_tx: &client_event_tx,
+                },
+            )
+            .await;
+        }
+        Request::CloseApplet {
+            id,
+            session_id,
+            instance,
+        } => {
+            handle_close_applet(id, session_id, instance, &client_event_tx);
         }
         Request::CommShare {
             id,
@@ -207,6 +282,7 @@ pub(super) async fn handle_lightweight_control_request(
             delivery,
             wake,
             tldr,
+            to_swarm,
         } => {
             handle_comm_message(
                 id,
@@ -217,6 +293,7 @@ pub(super) async fn handle_lightweight_control_request(
                 delivery,
                 wake,
                 tldr,
+                to_swarm,
                 &client_event_tx,
                 sessions,
                 soft_interrupt_queues,
@@ -243,6 +320,39 @@ pub(super) async fn handle_lightweight_control_request(
                 file_touch,
                 sessions,
                 client_connections,
+            )
+            .await;
+        }
+        Request::CommListSwarms {
+            id,
+            session_id: req_session_id,
+        } => {
+            handle_comm_list_swarms(
+                id,
+                req_session_id,
+                &client_event_tx,
+                swarm_members,
+                swarms_by_id,
+                swarm_coordinators,
+            )
+            .await;
+        }
+        Request::CommSetSwarmLabel {
+            id,
+            session_id: req_session_id,
+            label,
+        } => {
+            handle_comm_set_swarm_label(
+                id,
+                req_session_id,
+                label,
+                &client_event_tx,
+                swarm_members,
+                swarms_by_id,
+                swarm_coordinators,
+                event_history,
+                event_counter,
+                swarm_event_tx,
             )
             .await;
         }
@@ -828,6 +938,7 @@ pub(super) async fn handle_lightweight_control_request(
                 id: other.id(),
                 message: "unsupported lightweight control request".to_string(),
                 retry_after_secs: None,
+                server_resumes: false,
             });
         }
     }

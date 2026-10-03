@@ -14,12 +14,14 @@
 //! started turn in their UI.
 
 use super::client_lifecycle::process_locked_message_streaming_mpsc;
+use super::usage_limit_resume::ResumeOutcome;
 use super::{
     SwarmEvent, SwarmMember, session_event_fanout_sender, truncate_detail, update_member_status,
     update_member_status_with_report,
 };
 use crate::agent::Agent;
 use crate::protocol::ServerEvent;
+use futures::FutureExt;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -116,38 +118,80 @@ pub(super) async fn spawn_tracked_live_turn(
 
     let event_tx = session_event_fanout_sender(session_id.to_string(), Arc::clone(&swarm.members));
     let session_id = session_id.to_string();
+    let agent_arc = OwnedMutexGuard::mutex(&agent).clone();
     tokio::spawn(async move {
         let start_message_index = agent.message_count();
-        let result = if let Some(display_role) = display_role {
-            agent
-                .run_once_streaming_mpsc_with_display_role(
+        let resume_reminder = system_reminder.clone();
+        let (result, stop_reason) = catch_live_turn_panic(async {
+            if let Some(display_role) = display_role {
+                agent
+                    .run_once_streaming_mpsc_with_display_role(
+                        &message,
+                        vec![],
+                        system_reminder,
+                        event_tx.clone(),
+                        Some(display_role),
+                    )
+                    .await
+            } else {
+                process_locked_message_streaming_mpsc(
+                    &mut agent,
                     &message,
                     vec![],
                     system_reminder,
                     event_tx.clone(),
-                    Some(display_role),
                 )
                 .await
-        } else {
-            process_locked_message_streaming_mpsc(
-                &mut agent,
-                &message,
-                vec![],
-                system_reminder,
-                event_tx.clone(),
-            )
-            .await
-        };
+            }
+        })
+        .await;
         let completion_report = result
             .is_ok()
             .then(|| agent.latest_assistant_text_after(start_message_index))
             .flatten();
+        // A usage limit that resets later is a pause, not a failure: wait for
+        // the reset and continue the same turn (bounded, see
+        // usage_limit_resume). Other errors and panics fail as before.
+        let (result, completion_report, reservation) = match result {
+            Err(error) if stop_reason == crate::protocol::TurnStopReason::Failure => {
+                match super::usage_limit_resume::resume_turn_after_usage_limit(
+                    agent_arc,
+                    Some(agent),
+                    &session_id,
+                    error,
+                    resume_reminder,
+                    &event_tx,
+                    &swarm,
+                    &super::usage_limit_resume::no_wait_hook,
+                )
+                .await
+                {
+                    ResumeOutcome::NotUsageLimit { error, guard } => {
+                        (Err((error, None)), None, guard)
+                    }
+                    ResumeOutcome::Failed {
+                        error,
+                        retry_after_secs,
+                        guard,
+                    } => (Err((error, retry_after_secs)), None, guard),
+                    ResumeOutcome::Completed {
+                        guard,
+                        completion_report,
+                    } => (Ok(()), completion_report, Some(guard)),
+                    ResumeOutcome::Superseded => return,
+                }
+            }
+            Err(error) => {
+                let retry_after_secs = super::usage_limit_resume::error_retry_after_secs(&error);
+                (Err((error, retry_after_secs)), None, Some(agent))
+            }
+            Ok(()) => (Ok(()), completion_report, Some(agent)),
+        };
         // Keep the reservation until after the terminal status is published.
         // Releasing it earlier lets a follow-up wake reserve the agent and
         // publish `running`, which this turn's later `ready`/`failed` would
         // then overwrite, hiding the newer turn and suppressing its
         // coordinator completion notification.
-        let reservation = agent;
         match result {
             Ok(()) => {
                 update_member_status_with_report(
@@ -164,7 +208,7 @@ pub(super) async fn spawn_tracked_live_turn(
                 .await;
                 let _ = event_tx.send(ServerEvent::Done { id: 0 });
             }
-            Err(error) => {
+            Err((error, retry_after_secs)) => {
                 crate::logging::error(&format!(
                     "Server-initiated turn failed for live session {}: {}",
                     session_id, error
@@ -180,10 +224,16 @@ pub(super) async fn spawn_tracked_live_turn(
                     Some(&swarm.event_tx),
                 )
                 .await;
+                let _ = event_tx.send(ServerEvent::TurnStopped {
+                    reason: stop_reason,
+                    message: crate::util::format_error_chain(&error),
+                    provider_stop_reason: None,
+                });
                 let _ = event_tx.send(ServerEvent::Error {
                     id: 0,
                     message: crate::util::format_error_chain(&error),
-                    retry_after_secs: None,
+                    retry_after_secs,
+                    server_resumes: false,
                 });
             }
         }
@@ -238,4 +288,53 @@ pub(super) async fn run_live_system_turn_if_idle(
     )
     .await;
     true
+}
+
+/// Catch only unwind panics. A killed process cannot emit a trustworthy event.
+async fn catch_live_turn_panic<F>(turn: F) -> (anyhow::Result<()>, crate::protocol::TurnStopReason)
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    use crate::protocol::TurnStopReason;
+    match std::panic::AssertUnwindSafe(turn).catch_unwind().await {
+        Ok(result) => (result, TurnStopReason::Failure),
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            (
+                Err(anyhow::anyhow!("Processing task panicked: {}", message)),
+                TurnStopReason::Crash,
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod stop_reason_tests {
+    use super::catch_live_turn_panic;
+    use crate::protocol::TurnStopReason;
+
+    #[tokio::test]
+    async fn abnormal_stop_classifies_panics_without_parsing_error_strings() {
+        let (result, reason) = catch_live_turn_panic(async { panic!("provider exploded") }).await;
+        assert_eq!(reason, TurnStopReason::Crash);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("provider exploded")
+        );
+        let (result, reason) = catch_live_turn_panic(async {
+            Err(anyhow::anyhow!(
+                "Processing task panicked: just provider text"
+            ))
+        })
+        .await;
+        assert_eq!(reason, TurnStopReason::Failure);
+        assert!(result.is_err());
+        assert!(catch_live_turn_panic(async { Ok(()) }).await.0.is_ok());
+    }
 }

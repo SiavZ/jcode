@@ -30,6 +30,7 @@ pub(super) async fn process_turn_with_input(
     {
         Ok(()) => {
             app.last_stream_error = None;
+            app.local_usage_limit_resume_attempts = 0;
             app.last_submitted_input = None;
         }
         Err(error) => {
@@ -56,12 +57,20 @@ pub(super) async fn process_turn_with_input(
         return;
     }
 
+    // A quota hold remains the same logical turn. Do not queue pokes or
+    // drain user followups while waiting, or after its resume budget trips.
+    if app.local_usage_limit_resume_attempts > 0 {
+        finish_turn(app);
+        return;
+    }
     app.process_queued_messages(terminal, event_stream).await;
     finish_turn(app);
 }
 
 pub(super) fn handle_tick(app: &mut App) -> bool {
+    let reset_redraw = app.poll_usage_reset();
     app.refresh_terminal_title_metrics();
+    app.sync_herdr_agent_state();
     // Liveness breadcrumb: if the UI loop wedges, the watchdog reports this as
     // the last phase that made progress.
     crate::logging::watchdog::beat("tui.idle_tick");
@@ -70,7 +79,7 @@ pub(super) fn handle_tick(app: &mut App) -> bool {
     // draw site. Excluding it here instead would mean animation ticks request
     // no paint at all, which drops the animation to whatever unrelated events
     // happen to trigger (~4fps in practice).
-    let mut needs_redraw = crate::tui::periodic_redraw_required(app);
+    let mut needs_redraw = reset_redraw | crate::tui::periodic_redraw_required(app);
     needs_redraw |= app.flush_pending_resize_redraw();
     app.maybe_capture_runtime_memory_heartbeat();
     app.maybe_release_idle_heap();
@@ -79,13 +88,14 @@ pub(super) fn handle_tick(app: &mut App) -> bool {
     needs_redraw |= app.maybe_push_idle_cold_cache_warning();
     needs_redraw |= app.progress_copy_selection_edge_autoscroll();
     app.progress_mouse_scroll_animation();
-    needs_redraw |= app.update_chat_overscroll();
     needs_redraw |= app.update_pinned_images_auto_hide();
     // Dissolve stale (off-screen) reasoning traces with zero visible motion.
     needs_redraw |= app.gc_offscreen_reasoning_traces();
     // Adopt the resolved scroll position once a frame containing newly loaded
     // older history has rendered, so manual scrolling resumes seamlessly.
     needs_redraw |= app.reconcile_history_anchor();
+    // Same for a resize: adopt the resolved row once the rewrap has rendered.
+    needs_redraw |= app.reconcile_resize_anchor();
     if app.submit_input_on_startup && !app.is_processing {
         app.submit_input_on_startup = false;
         app.submit_input();
@@ -122,13 +132,16 @@ pub(super) fn handle_tick(app: &mut App) -> bool {
         && std::time::Instant::now() >= reset_time
     {
         app.rate_limit_reset = None;
+        let account_change_resend = app.account_change_resend_at.take() == Some(reset_time);
         let queued_count = app.queued_messages.len();
-        let msg = if queued_count > 0 {
-            format!("✓ Rate limit reset. Retrying... (+{} queued)", queued_count)
-        } else {
-            "✓ Rate limit reset. Retrying...".to_string()
-        };
-        app.push_display_message(DisplayMessage::system(msg));
+        if !account_change_resend {
+            let msg = if queued_count > 0 {
+                format!("✓ Rate limit reset. Retrying... (+{} queued)", queued_count)
+            } else {
+                "✓ Rate limit reset. Retrying...".to_string()
+            };
+            app.push_display_message(DisplayMessage::system(msg));
+        }
         app.pending_turn = true;
         needs_redraw = true;
     }
@@ -202,7 +215,12 @@ pub(super) fn handle_bus_event(
             true
         }
         Ok(BusEvent::LoginCompleted(login)) => {
+            let success = login.success;
+            let provider = login.provider.clone();
             app.handle_login_completed(login);
+            if success {
+                app.release_rate_limit_hold_after_credentials_changed(Some(&provider));
+            }
             true
         }
         Ok(BusEvent::OnboardingModelValidated(result)) => {
@@ -285,6 +303,7 @@ pub(super) fn handle_bus_event(
             app.handle_dictation_failure(message);
             true
         }
+        Ok(BusEvent::VoiceInputWake) => app.handle_voice_input_wake_local(),
         Ok(BusEvent::CompactionFinished) => app.poll_compaction_completion(),
         Ok(BusEvent::SidePanelUpdated(update)) => {
             if update.session_id == app.session.id {
@@ -413,7 +432,10 @@ fn apply_terminal_event(
             crate::tui::ui::note_key_event_read();
             app.note_client_interaction();
             app.update_copy_badge_key_event(key);
-            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            app.observe_voice_key_release(&key);
+            if app.handle_voice_key_event(&key) {
+                // Voice keys work from every screen and never type.
+            } else if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                 app.handle_key_press_event(key)?;
             }
             Ok(true)
@@ -614,7 +636,8 @@ pub(super) fn finish_turn(app: &mut App) {
     app.thinking_prefix_emitted = false;
     app.thinking_buffer.clear();
     app.note_runtime_memory_event_force("turn_completed", "local_turn_finished");
-    let followup_scheduled = app.schedule_turn_end_followups();
+    let followup_scheduled =
+        app.local_usage_limit_resume_attempts == 0 && app.schedule_turn_end_followups();
     if !followup_scheduled {
         app.clear_visible_turn_started();
         if !app.pending_queued_dispatch && app.queued_messages.is_empty() {

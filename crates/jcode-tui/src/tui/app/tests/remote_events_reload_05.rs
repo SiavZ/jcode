@@ -36,6 +36,7 @@ fn test_busy_automatic_continuation_waits_for_running_turn_without_retrying() {
                 id: rejected_id,
                 message: "Already processing a message".to_string(),
                 retry_after_secs: None,
+                server_resumes: false,
             },
             &mut remote,
         );
@@ -137,6 +138,7 @@ fn test_disconnect_recovers_inflight_queued_continuation_to_queue() {
         auto_retry: false,
         retry_attempts: 0,
         retry_at: None,
+        overload_attempts: 0,
     });
     app.rate_limit_reset = None;
 
@@ -170,6 +172,7 @@ fn test_disconnect_still_clears_pending_for_non_queued_shapes() {
         auto_retry: true,
         retry_attempts: u8::MAX,
         retry_at: None,
+        overload_attempts: 0,
     });
 
     let mut state = remote::RemoteRunState::default();
@@ -179,6 +182,36 @@ fn test_disconnect_still_clears_pending_for_non_queued_shapes() {
         app.queued_messages().is_empty(),
         "non-continuation pending shapes must not be converted into queued messages"
     );
+}
+
+#[test]
+fn test_reload_keeps_overload_resend_budget() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let session_id = format!("test-overload-budget-reload-{}", std::process::id());
+        app.rate_limit_pending_message = Some(PendingRemoteMessage {
+            content: "explain the bug".to_string(),
+            images: vec![],
+            is_system: false,
+            system_reminder: None,
+            auto_retry: true,
+            retry_attempts: 0,
+            retry_at: None,
+            overload_attempts: 2,
+        });
+        app.rate_limit_reset = Some(Instant::now() + Duration::from_secs(60));
+
+        app.save_input_for_reload(&session_id);
+        let restored =
+            App::restore_input_for_reload(&session_id).expect("reload state should exist");
+        let pending = restored
+            .rate_limit_pending_message
+            .expect("held turn must survive reload");
+        assert_eq!(
+            pending.overload_attempts, 2,
+            "reload must not reset the overload resend budget"
+        );
+    });
 }
 
 #[test]
@@ -197,6 +230,7 @@ fn test_save_input_for_reload_persists_inflight_queued_continuation() {
         auto_retry: false,
         retry_attempts: 0,
         retry_at: None,
+        overload_attempts: 0,
     });
     app.rate_limit_reset = None;
 
@@ -943,9 +977,16 @@ fn test_gate_digest_is_delivered_at_turn_end_and_rearms_next_cycle() {
         app.queued_messages.clear();
         app.pending_queued_dispatch = false;
         assert!(
-            !app.schedule_auto_poke_followup_if_needed(),
-            "with nothing left outstanding the cycle should finish"
+            app.schedule_auto_poke_followup_if_needed(),
+            "with nothing left outstanding the final response should be requested"
         );
+        assert_eq!(
+            app.queued_messages,
+            vec![crate::todo::TODO_FINAL_RESPONSE_CONTINUATION_MESSAGE.to_string()]
+        );
+        app.queued_messages.clear();
+        app.pending_queued_dispatch = false;
+        assert!(!app.schedule_auto_poke_followup_if_needed());
         assert!(
             !app.todo_gate_digest_delivered,
             "a finished cycle must re-arm the review for later work"
@@ -1087,6 +1128,84 @@ fn completed_cycle_rearms_auto_poke_only_when_default_on() {
         assert!(
             app.auto_poke_incomplete_todos,
             "default-on auto-poke should cover the next batch of work too"
+        );
+
+        // The final handoff must stay latched across a client reload too.
+        app.save_input_for_reload(&app.session.id);
+        let restored = App::restore_input_for_reload(&app.session.id)
+            .expect("final handoff should survive reload");
+        let mut reloaded = create_test_app();
+        reloaded.session.id = app.session.id.clone();
+        reloaded.auto_poke_incomplete_todos = true;
+        reloaded.auto_poke_default_on = true;
+        reloaded.apply_restored_reload_input(restored);
+        assert_eq!(
+            reloaded.final_response_todo_fingerprint,
+            app.final_response_todo_fingerprint
+        );
+        assert!(reloaded.todo_final_response_requested);
+        app = reloaded;
+
+        // An overdue timed review alone must not restart finished work.
+        let review_path = crate::storage::jcode_dir()
+            .expect("jcode home")
+            .join("todos")
+            .join(format!("{}-review-state.json", app.session.id));
+        crate::storage::write_json_fast(
+            &review_path,
+            &serde_json::json!({
+                "cycle_started_at": "2020-01-01T00:00:00Z",
+                "review_delivered": false,
+            }),
+        )
+        .expect("age review");
+
+        // A late observation must not resurrect gates after the final answer,
+        // even when the scheduler is called repeatedly with the same todo state.
+        crate::todo::append_gate_observations(
+            &app.session.id,
+            &[crate::todo::GateObservation {
+                kind: crate::todo::GateObservationKind::IntentUnderstanding,
+                group: None,
+                state: Some("uncertain".to_string()),
+            }],
+        )
+        .expect("record late observation");
+        for _ in 0..3 {
+            assert!(!app.schedule_auto_poke_followup_if_needed());
+            assert!(app.queued_messages.is_empty());
+            assert!(!app.pending_queued_dispatch);
+        }
+
+        // Rewriting identical data is not a new cycle either.
+        crate::todo::save_todos(&app.session.id, &[completed("todo-1")]).expect("save");
+        assert!(!app.schedule_auto_poke_followup_if_needed());
+
+        assert!(
+            crate::todo::take_long_session_review_if_due(&app.session.id)
+                .expect("the final-response guard must not consume the timed review")
+        );
+
+        // A real todo change re-arms the quality checks and final handoff.
+        let mut changed = completed("todo-1");
+        changed.completion_confidence = Some(crate::todo::ConfidenceState::Plausible);
+        crate::todo::save_todos(&app.session.id, &[changed]).expect("save changed todo");
+        assert!(app.schedule_auto_poke_followup_if_needed());
+        assert!(app.queued_messages[0].starts_with(crate::todo::TODO_GATE_DIGEST_PREFIX));
+        assert!(!app.todo_final_response_requested);
+        app.queued_messages.clear();
+        app.pending_queued_dispatch = false;
+        assert!(app.schedule_auto_poke_followup_if_needed());
+        assert!(
+            app.queued_messages[0].starts_with(crate::todo::TODO_COMPLETION_CONTINUATION_MESSAGE)
+        );
+        app.queued_messages.clear();
+        app.pending_queued_dispatch = false;
+        crate::todo::save_todos(&app.session.id, &[completed("todo-1")]).expect("save validated");
+        assert!(app.schedule_auto_poke_followup_if_needed());
+        assert_eq!(
+            app.queued_messages,
+            vec![crate::todo::TODO_FINAL_RESPONSE_CONTINUATION_MESSAGE.to_string()]
         );
 
         // An explicit /poke off must stick.

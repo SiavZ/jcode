@@ -110,6 +110,12 @@ pub(crate) struct Args {
     #[arg(short, long, global = true)]
     pub(crate) model: Option<String>,
 
+    /// Use this saved account for this window/run only (repeatable, one per
+    /// provider; `claude-fox`, `openai-otter`, or an account email). Other
+    /// windows and the default account are unchanged.
+    #[arg(long = "account", value_name = "LABEL")]
+    pub(crate) account: Vec<String>,
+
     /// Named provider profile from [providers.<name>] in config.toml.
     /// Implies --provider openai-compatible for OpenAI-compatible profiles.
     #[arg(long, global = true)]
@@ -181,6 +187,10 @@ pub(crate) enum Command {
 
     /// Run a single message and exit
     Run {
+        /// Use this saved account for this run (repeatable, one per provider).
+        #[arg(long = "account", value_name = "LABEL")]
+        account: Vec<String>,
+
         /// Emit a machine-readable JSON result instead of streaming text
         #[arg(long, conflicts_with = "ndjson")]
         json: bool,
@@ -207,9 +217,24 @@ pub(crate) enum Command {
         #[arg(long, short = 'a')]
         account: Option<String>,
 
+        /// Make this login the default account for new windows.
+        #[arg(long = "default", id = "make_default")]
+        make_default: bool,
+
         /// Do not open a local browser. Show a login QR for another device (useful over SSH).
         #[arg(long, alias = "headless")]
         no_browser: bool,
+
+        /// Sign in with the installed Claude Code CLI instead of Jcode's OAuth flow.
+        /// This is the default for `--provider claude` when `claude` is installed.
+        /// Jcode asks before reusing the CLI's credentials.
+        #[arg(long, conflicts_with_all = ["no_browser", "make_default", "account", "oauth"])]
+        claude_code: bool,
+
+        /// Use Jcode's own OAuth browser flow for Claude even when the
+        /// Claude Code CLI is installed.
+        #[arg(long)]
+        oauth: bool,
 
         /// Print a script-friendly auth URL and persist temporary login state for later completion.
         #[arg(long, conflicts_with_all = ["callback_url", "auth_code"])]
@@ -400,14 +425,18 @@ pub(crate) enum Command {
         uninstall: bool,
     },
 
-    /// Install a launcher so jcode appears in your app launcher
+    /// Install platform launcher integration (Windows shortcut; macOS notification helper)
     SetupLauncher,
 
     /// Browser automation setup and status
     Browser {
-        /// Action (setup, status)
+        /// Action (setup, status, detect)
         #[arg(default_value = "setup")]
         action: String,
+
+        /// Browser to target: auto (default: detect your browser), firefox,
+        /// chrome, chromium, edge, brave, or safari
+        browser: Option<String>,
     },
 
     /// Replay a saved session in the TUI
@@ -698,6 +727,100 @@ pub(crate) enum CloudCommand {
         #[command(subcommand)]
         action: CloudSessionsCommand,
     },
+
+    /// Move a live session (transcript, repo state, env notes) to a cloud host
+    /// and keep working there. Your local files stay editable. Git reconciles
+    /// both sides when the session comes back with `jcode cloud return`.
+    Move {
+        /// Session ID or name. Defaults to the session this command runs in.
+        #[arg(long)]
+        session: Option<String>,
+        #[command(flatten)]
+        target: CloudMoveTarget,
+        /// Allow moving while the session is mid-turn (the agent itself runs /cloud).
+        #[arg(long)]
+        allow_active: bool,
+        /// Prepare and verify only. Do not hand ownership to the cloud host.
+        #[arg(long)]
+        dry_run: bool,
+        /// After a successful move, attach this terminal to the cloud session.
+        #[arg(long)]
+        attach: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Bring a moved session back: pull the cloud transcript and merge its git
+    /// work into your local checkout with a normal 3-way merge.
+    Return {
+        #[arg(long)]
+        session: Option<String>,
+        #[command(flatten)]
+        target: CloudMoveTarget,
+        /// Bring the work back as refs only (refs/jcode-cloud/<session>/*) without touching the working tree.
+        #[arg(long)]
+        refs_only: bool,
+        /// After returning, resume the session in this terminal.
+        #[arg(long)]
+        attach: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show where moved sessions live and how their repos have diverged.
+    Where {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Attach this terminal to a session that lives on a cloud host.
+    Attach {
+        #[arg(long)]
+        session: Option<String>,
+    },
+
+    /// Internal: remote side of `cloud move` (reads a bundle tarball on stdin).
+    #[command(hide = true)]
+    Receive {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Internal: remote side of `cloud move` commit phase.
+    #[command(hide = true)]
+    Activate {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        epoch: u64,
+    },
+
+    /// Internal: remote side of `cloud return` (writes a bundle tarball to stdout).
+    #[command(hide = true)]
+    Export {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        epoch: u64,
+    },
+}
+
+#[derive(Parser, Debug, Clone, Default)]
+pub(crate) struct CloudMoveTarget {
+    /// SSH host alias for the cloud machine. Defaults to [cloud] host in config
+    /// or $JCODE_CLOUD_HOST.
+    #[arg(long)]
+    pub(crate) host: Option<String>,
+    /// Remote jcode binary (name or path). Defaults to `jcode`.
+    #[arg(long)]
+    pub(crate) remote_binary: Option<String>,
+    /// Local command used in place of `ssh <host>` (for tests and custom
+    /// transports). Receives the remote shell command as its final argument.
+    /// Also read from $JCODE_CLOUD_TRANSPORT.
+    #[arg(long, hide = true)]
+    pub(crate) transport: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]

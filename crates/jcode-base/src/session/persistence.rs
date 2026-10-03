@@ -244,6 +244,8 @@ impl Session {
         let journal_entries = replay_stats.entries;
         let journal_ms = journal_start.elapsed().as_millis();
         let finalize_start = Instant::now();
+        session.refresh_agent_model_overrides()?;
+        session.backfill_prompt_title();
         session.reset_persist_state(path.exists());
         session.reset_provider_messages_cache();
         session.mark_memory_profile_dirty();
@@ -299,7 +301,9 @@ impl Session {
 
     pub fn load(session_id: &str) -> Result<Self> {
         let path = session_path(session_id)?;
-        Self::load_from_path(&path)
+        let mut session = Self::load_from_path(&path)?;
+        session.refresh_agent_model_overrides()?;
+        Ok(session)
     }
 
     /// Load only the metadata needed for remote-client startup.
@@ -311,7 +315,9 @@ impl Session {
         let path = session_path(session_id)?;
         let reader = BufReader::new(std::fs::File::open(&path)?);
         let stub: SessionStartupStub = serde_json::from_reader(reader)?;
-        Ok(Self::session_from_startup_stub(stub))
+        let mut session = Self::session_from_startup_stub(stub);
+        session.refresh_agent_model_overrides()?;
+        Ok(session)
     }
 
     pub fn load_for_remote_startup(session_id: &str) -> Result<Self> {
@@ -323,6 +329,7 @@ impl Session {
         let snapshot: RemoteStartupSessionSnapshot = serde_json::from_reader(reader)?;
         let snapshot_ms = snapshot_start.elapsed().as_millis();
         let mut session = Self::session_from_remote_startup_snapshot(snapshot);
+        session.refresh_agent_model_overrides()?;
         let journal_path = session_journal_path_from_snapshot(&path);
         let journal_bytes = file_len_or_zero(&journal_path);
         let journal_start = Instant::now();
@@ -335,6 +342,8 @@ impl Session {
         })?;
         let journal_ms = journal_start.elapsed().as_millis();
         let finalize_start = Instant::now();
+        session.refresh_agent_model_overrides()?;
+        session.backfill_prompt_title();
         session.reset_persist_state(path.exists());
         session.reset_provider_messages_cache();
         session.mark_memory_profile_dirty();
@@ -372,6 +381,26 @@ impl Session {
     }
 
     pub fn save(&mut self) -> Result<()> {
+        self.save_inner(false)
+    }
+
+    /// Persist the session even when it has no visible conversation message
+    /// yet. Use this for sessions prepared by one process and attached to by
+    /// another (for example visible swarm spawns), where caller-configured
+    /// state such as model, provider, or effort must survive until attach.
+    pub fn save_prepared(&mut self) -> Result<()> {
+        self.save_inner(true)
+    }
+
+    fn save_inner(&mut self, force: bool) -> Result<()> {
+        self.refresh_agent_model_overrides()?;
+        // A session that migrated to another machine (or whose on-disk copy was
+        // replaced by a newer returned transcript) must not be overwritten by
+        // this stale in-memory copy.
+        if let Some(block) = self.migration_lease_block() {
+            crate::logging::warn(&format!("Session {} not persisted: {}", self.id, block));
+            return Ok(());
+        }
         self.updated_at = Utc::now();
         let path = session_path(&self.id)?;
         let journal_path = session_journal_path_from_snapshot(&path);
@@ -387,7 +416,12 @@ impl Session {
         // id find no file and silently treat the session as missing.
         // Parent linkage is also explicit state: an empty fork carries only a
         // hidden fork notice but must be loadable when its new client attaches.
-        if !self.persist_state.snapshot_exists
+        // An explicit system prompt, including an empty string, must likewise
+        // survive attachment before the first visible message.
+        // Canary (self-dev) and debug markers are likewise explicit: the
+        // selfdev tool and debug-socket clients read them back from disk.
+        if !force
+            && !self.persist_state.snapshot_exists
             && !self
                 .messages
                 .iter()
@@ -396,6 +430,9 @@ impl Session {
             && self.custom_title.is_none()
             && self.title.is_none()
             && self.parent_id.is_none()
+            && self.system_prompt.is_none()
+            && !self.is_canary
+            && !self.is_debug
         {
             return Ok(());
         }

@@ -24,6 +24,7 @@ pub(super) struct RestoredReloadInput {
     pub todos_view_enabled: bool,
     pub todo_confidence_spike_challenged: bool,
     pub last_todo_ownership_fingerprint: Option<String>,
+    pub final_response_todo_fingerprint: Option<String>,
 }
 
 impl App {
@@ -258,6 +259,7 @@ impl App {
             && !self.todos_view_enabled
             && !self.todo_confidence_spike_challenged
             && self.last_todo_ownership_fingerprint.is_none()
+            && self.final_response_todo_fingerprint.is_none()
         {
             // Nothing to save, but a stale file from an earlier run could
             // still hold old queued messages/input. Leaving it behind would
@@ -305,6 +307,7 @@ impl App {
                             "system_reminder": pending.system_reminder,
                             "auto_retry": pending.auto_retry,
                             "retry_attempts": pending.retry_attempts,
+                            "overload_attempts": pending.overload_attempts,
                         })
                     })
                 };
@@ -349,6 +352,7 @@ impl App {
                 "todos_view_enabled": self.todos_view_enabled,
                 "todo_confidence_spike_challenged": self.todo_confidence_spike_challenged,
                 "last_todo_ownership_fingerprint": self.last_todo_ownership_fingerprint,
+                "final_response_todo_fingerprint": self.final_response_todo_fingerprint,
             });
             let _ = std::fs::write(&path, data.to_string());
         }
@@ -533,6 +537,11 @@ impl App {
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0) as u8,
                     retry_at: None,
+                    // Older reload files have no count: start at 0 for those.
+                    overload_attempts: pending
+                        .get("overload_attempts")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u8,
                 });
             let rate_limit_reset = value
                 .get("rate_limit_reset_in_ms")
@@ -590,6 +599,10 @@ impl App {
                 split_view_enabled,
                 todos_view_enabled,
                 todo_confidence_spike_challenged,
+                final_response_todo_fingerprint: value
+                    .get("final_response_todo_fingerprint")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
                 last_todo_ownership_fingerprint: value
                     .get("last_todo_ownership_fingerprint")
                     .and_then(|v| v.as_str())
@@ -621,6 +634,7 @@ impl App {
             todos_view_enabled: false,
             todo_confidence_spike_challenged: false,
             last_todo_ownership_fingerprint: None,
+            final_response_todo_fingerprint: None,
         })
     }
 
@@ -639,6 +653,14 @@ impl App {
             self.set_status_notice("📌 Bookmark set - press again to return");
         }
         // If already at bottom with no bookmark, do nothing
+    }
+
+    /// `scroll_to_bottom` hotkey / "Jump to bottom" pill: go to the live tail
+    /// and resume auto-follow. Unlike the Ctrl+G bookmark this is one-way, so
+    /// any stashed bookmark is dropped.
+    pub(super) fn jump_to_chat_bottom(&mut self) {
+        self.scroll_bookmark = None;
+        self.follow_chat_bottom();
     }
 
     pub(super) fn follow_chat_bottom_for_typing(&mut self) {
@@ -670,21 +692,23 @@ impl App {
         } else {
             snapshot
         };
-        let mut snapshot = if self.observe_mode_enabled {
+        let snapshot = if self.observe_mode_enabled {
             self.decorate_side_panel_with_observe(snapshot, focus_observe)
         } else {
             snapshot
         };
-        if self.side_panel_user_hidden && snapshot.focused_page_id.is_some() {
-            snapshot.focused_page_id = None;
-        }
         self.apply_side_panel_snapshot(snapshot);
     }
 
     pub(super) fn apply_side_panel_snapshot(
         &mut self,
-        snapshot: crate::side_panel::SidePanelSnapshot,
+        mut snapshot: crate::side_panel::SidePanelSnapshot,
     ) {
+        // Local app panels refresh through this path too. Content updates must
+        // not undo a user dismissal or replace the saved selection.
+        if self.side_panel_user_hidden {
+            snapshot.focused_page_id = None;
+        }
         let focused_before = self.side_panel.focused_page_id.clone();
         let focused_after = snapshot.focused_page_id.clone();
         let focused_changed = focused_before != focused_after;
@@ -698,6 +722,9 @@ impl App {
         }
         self.last_side_panel_refresh = None;
         self.side_panel = snapshot;
+        if self.side_panel.focused_page().is_none() {
+            self.side_panel_fullscreen = false;
+        }
         self.note_runtime_memory_event("side_panel_updated", "side_panel_snapshot_applied");
         if focused_changed {
             self.diff_pane_scroll = 0;
@@ -1198,8 +1225,13 @@ fn format_cache_stats(app: &App) -> String {
     };
     let read_pct = format_pct(read, effective_reported);
     let write_pct = format_pct(write, effective_reported);
-    let optimal_pct =
-        (optimal > 0 && remote_cache_read == 0).then(|| cache_ratio_pct(read, optimal));
+    // Optimal input is live-only, so compare it against live-only reads.
+    let optimal_pct = (optimal > 0).then(|| {
+        cache_ratio_pct(
+            app.token_accounting.total_cache_optimal_read_tokens,
+            optimal,
+        )
+    });
     let cache_totals_source = match (
         remote_usage.is_some(),
         app.token_accounting.total_cache_prompt_tokens > 0,
@@ -1918,10 +1950,7 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
                 app.set_status_notice("Cache stats");
             }
             "extend" | "1h" | "1hour" | "extended" | "5m" | "5min" | "default" | "reset" => {
-                let enabled = match arg {
-                    "5m" | "5min" | "default" | "reset" => false,
-                    _ => true,
-                };
+                let enabled = !matches!(arg, "5m" | "5min" | "default" | "reset");
                 match crate::config::Config::set_anthropic_cache_ttl_1h(enabled) {
                     Ok(()) => {
                         let message = if enabled {

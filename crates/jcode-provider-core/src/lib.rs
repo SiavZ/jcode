@@ -1,3 +1,4 @@
+pub mod account_pin;
 pub mod anthropic;
 pub mod attempt_tracker;
 pub mod auth_mode;
@@ -6,6 +7,7 @@ pub mod failover;
 pub mod fallback_pick;
 pub mod fingerprint;
 pub mod model_id;
+pub mod model_names;
 pub mod models;
 pub mod openai_schema;
 pub mod pricing;
@@ -13,10 +15,15 @@ pub mod reasoning;
 pub mod retry_after;
 pub mod selection;
 pub mod transport;
+pub mod usage_limit;
 
 pub use jcode_usage_types::{ModelUsage, compare_model_usage};
 pub use transport::is_transient_transport_error;
+pub use usage_limit::{
+    AccountUsageLimit, account_usage_limit_marker, classify_account_usage_limit,
+};
 
+pub use account_pin::{AccountPin, AccountPinSlot, AccountProviderKind, AccountScope};
 pub use anthropic::{
     ANTHROPIC_OAUTH_BETA_HEADERS, ANTHROPIC_OAUTH_BETA_HEADERS_1M, AnthropicContextMode,
     AnthropicReasoningCaps, anthropic_context_mode, anthropic_effectively_1m,
@@ -31,7 +38,7 @@ pub use auth_mode::{
 pub use catalog_refresh::{ModelCatalogRefreshSummary, summarize_model_catalog_refresh};
 pub use failover::{
     FailoverDecision, ProviderFailoverPrompt, classify_failover_error_message,
-    parse_failover_prompt_message,
+    is_billing_exhausted_error_message, parse_failover_prompt_message,
 };
 pub use fallback_pick::{
     FallbackPickOptions, error_looks_like_credential_failure, pick_next_fallback_route,
@@ -57,6 +64,9 @@ pub use selection::{
     model_name_for_provider, parse_provider_hint, provider_from_model_key, provider_key,
     provider_label, strip_own_model_prefix,
 };
+
+/// When to resume a turn that stopped on a subscription usage limit.
+pub mod usage_limit_resume;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -171,6 +181,14 @@ pub trait Provider: Send + Sync {
 
     /// Whether this provider path can safely receive `ContentBlock::Image` inputs.
     fn supports_image_input(&self) -> bool {
+        false
+    }
+
+    /// Whether this provider path natively supports deferred tool definitions
+    /// (`ToolDefinition::defer_loading`) loaded by `ContentBlock::ToolReference`
+    /// without invalidating the prompt cache. Providers that return false must
+    /// tolerate (and drop) deferred definitions and reference blocks.
+    fn supports_deferred_tools(&self) -> bool {
         false
     }
 
@@ -360,6 +378,41 @@ pub trait Provider: Send + Sync {
     /// this; the default is a no-op.
     fn reload_credentials(&self) {}
 
+    /// Account pin for this provider instance (one per session fork).
+    /// `None` means the instance follows the default account.
+    fn account_pin(&self, _kind: AccountProviderKind) -> Option<AccountPin> {
+        None
+    }
+
+    /// Pin (or unpin with `None`) this instance to one stored account. Affects
+    /// only this instance, never other sessions or the stored default.
+    fn set_account_pin(&self, _kind: AccountProviderKind, _pin: Option<AccountPin>) -> Result<()> {
+        Ok(())
+    }
+
+    /// Account label the last request used (the pin, or the default account).
+    fn resolved_account_label(&self, _kind: AccountProviderKind) -> Option<String> {
+        None
+    }
+
+    /// Per-session same-provider account failover toggle. None = config default.
+    fn set_account_failover(&self, _enabled: Option<bool>) {}
+
+    /// Preferred pin to return to after an automatic failover move.
+    fn account_failover_home(&self, _kind: AccountProviderKind) -> Option<AccountPin> {
+        None
+    }
+
+    /// Restore the home pin (from the session on resume, or None to clear it).
+    fn set_account_failover_home(&self, _kind: AccountProviderKind, _home: Option<AccountPin>) {}
+
+    /// Called by the agent at turn start. When a home account's recorded reset
+    /// has passed (local check, config account_failover_return_home), re-pin
+    /// it, clear the home, and return the kinds that moved.
+    fn return_account_home_if_reset(&self) -> Vec<AccountProviderKind> {
+        Vec::new()
+    }
+
     /// Human-facing label for the runtime backing this provider instance.
     /// Unlike `display_name`, this reflects instance state (e.g. which
     /// OpenAI-compatible profile an aggregator runtime currently serves).
@@ -465,31 +518,114 @@ pub trait Provider: Send + Sync {
 
     /// Simple completion that returns text directly (no streaming).
     async fn complete_simple(&self, prompt: &str, system: &str) -> Result<String> {
-        use futures::StreamExt;
+        collect_simple_completion(self, prompt, system)
+            .await
+            .map(|(text, _)| text)
+    }
 
-        let messages = vec![Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: prompt.to_string(),
-                cache_control: None,
-            }],
-            timestamp: None,
-            tool_duration_ms: None,
-        }];
+    /// Like [`Provider::complete_simple`], but also returns the provider-reported
+    /// token usage so side calls (compaction summaries, memory sidecar) can be
+    /// accounted for.
+    ///
+    /// Internal callers use this method, so a provider that customizes simple
+    /// completion must override this method (and may override `complete_simple`
+    /// to match). The default streams through `complete`.
+    async fn complete_simple_with_usage(
+        &self,
+        prompt: &str,
+        system: &str,
+    ) -> Result<(String, SimpleCompletionUsage)> {
+        collect_simple_completion(self, prompt, system).await
+    }
+}
 
-        let response = self.complete(&messages, &[], system, None).await?;
-        let mut result = String::new();
-        tokio::pin!(response);
+/// Drive `Provider::complete` for a single user prompt and collect the text and
+/// provider-reported usage.
+pub async fn collect_simple_completion<P: Provider + ?Sized>(
+    provider: &P,
+    prompt: &str,
+    system: &str,
+) -> Result<(String, SimpleCompletionUsage)> {
+    use futures::StreamExt;
 
-        while let Some(event) = response.next().await {
-            match event {
-                Ok(StreamEvent::TextDelta(text)) => result.push_str(&text),
-                Ok(_) => {}
-                Err(err) => return Err(err),
-            }
+    let messages = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: prompt.to_string(),
+            cache_control: None,
+        }],
+        timestamp: None,
+        tool_duration_ms: None,
+    }];
+
+    let response = provider.complete(&messages, &[], system, None).await?;
+    let mut result = String::new();
+    let mut usage = SimpleCompletionUsage::default();
+    tokio::pin!(response);
+
+    while let Some(event) = response.next().await {
+        match event {
+            Ok(StreamEvent::TextDelta(text)) => result.push_str(&text),
+            Ok(StreamEvent::TokenUsage {
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+            }) => usage.observe(
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+            ),
+            Ok(_) => {}
+            Err(err) => return Err(err),
         }
+    }
 
-        Ok(result)
+    Ok((result, usage))
+}
+
+/// Provider-reported usage for a non-agent completion.
+///
+/// Streams may report usage more than once (for example a start event with
+/// input tokens and a final event with output tokens). Each field keeps the
+/// latest value reported, matching how the agent turn loop treats repeated
+/// `TokenUsage` events (they are cumulative snapshots, not deltas).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SimpleCompletionUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+}
+
+impl SimpleCompletionUsage {
+    pub fn observe(
+        &mut self,
+        input: Option<u64>,
+        output: Option<u64>,
+        cache_read: Option<u64>,
+        cache_creation: Option<u64>,
+    ) {
+        if input.is_some() {
+            self.input_tokens = input;
+        }
+        if output.is_some() {
+            self.output_tokens = output;
+        }
+        if cache_read.is_some() {
+            self.cache_read_input_tokens = cache_read;
+        }
+        if cache_creation.is_some() {
+            self.cache_creation_input_tokens = cache_creation;
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.input_tokens.is_none()
+            && self.output_tokens.is_none()
+            && self.cache_read_input_tokens.is_none()
+            && self.cache_creation_input_tokens.is_none()
     }
 }
 
@@ -860,8 +996,8 @@ impl RouteSelection {
 }
 
 /// Grok Build routing spec: `grok-4.6` and `grok-build:grok-4.6` both become
-/// `grok-build:grok-4.6` so `MultiProvider::set_model` dispatches to the ACP
-/// runtime instead of treating the bare id as the active provider's model.
+/// `grok-build:grok-4.6` so `MultiProvider::set_model` dispatches to the Grok
+/// Build runtime instead of treating the bare id as the active provider's model.
 pub fn grok_build_model_spec(model: &str) -> String {
     let bare = model.strip_prefix("grok-build:").unwrap_or(model).trim();
     format!("grok-build:{bare}")
@@ -1370,6 +1506,21 @@ fn reference_request_cost_micros(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simple_completion_usage_keeps_latest_reported_values() {
+        let mut usage = SimpleCompletionUsage::default();
+        assert!(usage.is_empty());
+        // Start event: input only.
+        usage.observe(Some(1_000), None, Some(700), None);
+        // Final event: output and a refreshed input snapshot.
+        usage.observe(Some(1_050), Some(90), None, Some(12));
+        assert_eq!(usage.input_tokens, Some(1_050));
+        assert_eq!(usage.output_tokens, Some(90));
+        assert_eq!(usage.cache_read_input_tokens, Some(700));
+        assert_eq!(usage.cache_creation_input_tokens, Some(12));
+        assert!(!usage.is_empty());
+    }
 
     #[test]
     fn metered_estimate_computes_reference_cost() {

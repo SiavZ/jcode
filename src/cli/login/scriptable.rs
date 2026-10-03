@@ -5,7 +5,11 @@ pub(super) fn auto_scriptable_flow_reason(
     options: &LoginOptions,
     stdin_is_terminal: bool,
 ) -> Option<&'static str> {
-    if options.print_auth_url || options.complete || options.has_provided_input() {
+    if options.claude_code
+        || options.print_auth_url
+        || options.complete
+        || options.has_provided_input()
+    {
         return None;
     }
 
@@ -862,6 +866,8 @@ pub(super) fn resolve_auth_input(value: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
+// Single caller; the fields map 1:1 onto the emitted prompt payload.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_scriptable_auth_prompt(
     provider: &str,
     auth_url: &str,

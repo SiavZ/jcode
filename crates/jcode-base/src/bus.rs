@@ -321,6 +321,12 @@ pub struct SidePanelUpdated {
     pub snapshot: SidePanelSnapshot,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AppletsUpdated {
+    pub session_id: String,
+    pub snapshot: jcode_applet_types::AgentApplets,
+}
+
 #[derive(Clone, Debug)]
 pub enum UpdateStatus {
     Checking,
@@ -449,6 +455,9 @@ pub enum BusEvent {
         session_id: Option<String>,
         message: String,
     },
+    /// Built-in voice input has new state (meter level, partial transcript,
+    /// or a final result). The owning client polls its recording on receipt.
+    VoiceInputWake,
     /// Background compaction task finished (check_and_apply should be called)
     CompactionFinished,
     /// Provider's available models list may have changed
@@ -459,6 +468,14 @@ pub enum BusEvent {
     /// Synchronous provider activation after a login/import has completed, so
     /// the model picker can stop hiding the stale pre-auth catalog.
     AuthCatalogRefreshReady,
+    /// Credentials changed (login, account switch, or an external edit of a
+    /// credential file). The server forwards this to every connected client
+    /// so turns held on the previous account's limit resend promptly.
+    CredentialsChanged {
+        provider: Option<String>,
+        /// Stored account label whose credentials changed. `None` = unknown/any.
+        account_label: Option<String>,
+    },
     /// A background provider setup task selected a model for this session.
     ProviderModelActivated {
         session_id: String,
@@ -469,6 +486,7 @@ pub enum BusEvent {
     },
     /// Side panel pages were updated for a session
     SidePanelUpdated(SidePanelUpdated),
+    AppletsUpdated(AppletsUpdated),
     /// Deferred Mermaid rendering completed and cached content may now be visible
     MermaidRenderCompleted,
     /// Productivity report finished generating off the UI thread

@@ -1,4 +1,5 @@
 use super::*;
+use ratatui::widgets::{Block, BorderType, Borders};
 use std::fmt::Write as _;
 use unicode_width::UnicodeWidthStr;
 
@@ -361,18 +362,16 @@ pub(super) fn draw_messages(
     let viewport_height = render_area.height as usize;
     // Pinned todo band (display.pin_todos): the full todo card rendered beneath
     // the sticky previous-prompt preview, including at the top of the transcript.
-    let (pinned_todo_band, pinned_todo_more_line) =
-        pinned_todo_band_lines(app, text_render_area.width, render_area.height);
+    let pinned_todo_band = pinned_todo_band_lines(app, text_render_area.width, render_area.height);
     let max_scroll = compute_max_scroll_with_prompt_preview(
         total_lines,
         wrapped_user_prompt_starts,
         user_prompt_texts,
         text_render_area,
-        pinned_todo_band.len() as u16,
+        pinned_todo_band.height(),
     );
 
     super::set_last_max_scroll(max_scroll);
-    update_user_prompt_positions(wrapped_user_prompt_starts);
 
     // When older compacted history is being loaded in, the app hands us the
     // reader's distance-from-bottom instead of an absolute offset. Distance from
@@ -386,8 +385,22 @@ pub(super) fn draw_messages(
                 .saturating_sub(lines_from_bottom)
                 .min(max_scroll)
         });
+    // A resize rewrapped the transcript while the reader was parked in history.
+    // The captured position is in content coordinates, so resolving it against
+    // this frame's geometry keeps the same message under the reader instead of
+    // reinterpreting a stale line index (issue #1412, persistent half).
+    let resize_anchor_scroll = if app.auto_scroll_paused() {
+        app.pending_resize_anchor()
+            .and_then(|pos| jcode_tui_messages::resolve_content_pos(&pos, &prepared, max_scroll))
+    } else {
+        // The anchor describes a reading position; following the tail is not one.
+        None
+    };
     let user_scroll = app.scroll_offset().min(max_scroll);
-    let scroll = if let Some(anchored) = anchored_scroll {
+    let scroll = if let Some(anchored) = resize_anchor_scroll {
+        super::set_tail_catchup_active(false);
+        anchored
+    } else if let Some(anchored) = anchored_scroll {
         super::set_tail_catchup_active(false);
         anchored
     } else if app.auto_scroll_paused() {
@@ -402,6 +415,9 @@ pub(super) fn draw_messages(
     super::set_last_total_wrapped_lines(total_lines);
     super::set_last_resolved_chat_scroll(scroll);
     super::set_last_chat_viewport_height(viewport_height);
+    // Retain the frame itself: it is the geometry (per-item row ranges), and
+    // handlers outside `draw` resolve anchors against it.
+    super::set_last_chat_frame(prepared.clone());
 
     let prompt_preview_lines = if crate::config::config().display.prompt_preview && scroll > 0 {
         compute_prompt_preview_line_count(
@@ -413,15 +429,18 @@ pub(super) fn draw_messages(
     } else {
         0u16
     };
-    let pinned_todo_lines = pinned_todo_band.len() as u16;
-    set_pinned_todo_more_area(pinned_todo_more_line.map(|line| {
+    let pinned_todo_lines = pinned_todo_band.height();
+    // The `… +N more` row sits inside the bordered card: one row below the
+    // top border and one column right of the left border.
+    set_pinned_todo_more_area(pinned_todo_band.more_line.map(|line| {
         Rect {
-            x: text_render_area.x,
+            x: text_render_area.x.saturating_add(2),
             y: render_area
                 .y
                 .saturating_add(prompt_preview_lines)
+                .saturating_add(1)
                 .saturating_add(line as u16),
-            width: text_render_area.width,
+            width: text_render_area.width.saturating_sub(4),
             height: 1,
         }
     }));
@@ -500,6 +519,7 @@ pub(super) fn draw_messages(
         // prompt preview) is synthetic (not part of the scrolled transcript), so
         // offset by it to keep the content rows aligned.
         scroll_top: scroll.saturating_sub(top_band_lines as usize),
+        content_start_row: top_band_lines as usize,
         ..Default::default()
     };
     margins
@@ -1218,7 +1238,7 @@ pub(super) fn draw_messages(
             height: pinned_todo_lines.min(render_area.height),
         };
         clear_area(frame, band_area);
-        frame.render_widget(Paragraph::new(pinned_todo_band), band_area);
+        render_pinned_todo_band(frame, band_area, pinned_todo_band);
     }
 
     if crate::config::config().display.prompt_preview && scroll > 0 {
@@ -1297,7 +1317,42 @@ pub(super) fn draw_messages(
         }
     }
 
-    if !show_native_scrollbar && app.auto_scroll_paused() && scroll < max_scroll {
+    let lines_below = max_scroll.saturating_sub(scroll);
+    let jump_pill = if app.auto_scroll_paused() && lines_below > 0 {
+        jump_to_bottom_pill_rect(
+            text_render_area,
+            top_band_lines,
+            app.jump_to_bottom_key_label().as_deref(),
+            lines_below,
+        )
+    } else {
+        None
+    };
+    set_jump_to_bottom_area(jump_pill.as_ref().map(|(rect, _)| *rect));
+
+    if let Some((pill_rect, pill_line)) = jump_pill {
+        clear_area(frame, pill_rect);
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::default().fg(accent_color()));
+        frame.render_widget(
+            Paragraph::new(pill_line)
+                .alignment(Alignment::Center)
+                .block(block),
+            pill_rect,
+        );
+        // Keep info widgets from docking on top of the pill.
+        let first = pill_rect.y.saturating_sub(render_area.y) as usize;
+        for row in first..first.saturating_add(pill_rect.height as usize) {
+            if let Some(width) = margins.right_widths.get_mut(row) {
+                *width = 0;
+            }
+            if let Some(width) = margins.left_widths.get_mut(row) {
+                *width = 0;
+            }
+        }
+    } else if !show_native_scrollbar && app.auto_scroll_paused() && scroll < max_scroll {
         let indicator = format!("↓{}", max_scroll - scroll);
         let indicator_area = Rect {
             x: render_area.x + render_area.width.saturating_sub(indicator.len() as u16 + 2),
@@ -1362,62 +1417,129 @@ fn windowed_min(widths: &[u16], window: usize) -> Vec<u16> {
     out
 }
 
-/// Lines for the pinned status band: optional todos followed by exactly one
-/// compact row per relevant background task. Completed tasks are shown briefly
-/// as confirmation, while running and failed tasks remain actionable.
-fn pinned_todo_band_lines(
-    app: &dyn TuiState,
-    width: u16,
-    viewport_height: u16,
-) -> (Vec<Line<'static>>, Option<usize>) {
-    if width < 16 || viewport_height < 3 {
-        return (Vec::new(), None);
+/// Pinned status band: an optional bordered todo card followed by exactly one
+/// compact row per relevant background task (unboxed, below the card).
+#[derive(Default)]
+struct PinnedTodoBand {
+    /// Todo rows drawn inside the rounded border. Empty means no box.
+    card: Vec<Line<'static>>,
+    title: String,
+    /// Index of the `… +N more` row within `card`.
+    more_line: Option<usize>,
+    tasks: Vec<Line<'static>>,
+}
+
+impl PinnedTodoBand {
+    fn card_height(&self) -> u16 {
+        if self.card.is_empty() {
+            0
+        } else {
+            self.card.len() as u16 + 2
+        }
     }
 
-    let task_lines: Vec<_> = app
+    fn height(&self) -> u16 {
+        self.card_height() + self.tasks.len() as u16
+    }
+}
+
+fn render_pinned_todo_band(frame: &mut Frame, area: Rect, band: PinnedTodoBand) {
+    let card_height = band.card_height().min(area.height);
+    if card_height > 0 {
+        let border_style = Style::default().fg(super::messages::todo_border_color());
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(border_style)
+            .padding(ratatui::widgets::Padding::horizontal(1))
+            .title(Span::styled(
+                band.title,
+                border_style.add_modifier(Modifier::BOLD),
+            ));
+        let card_area = Rect {
+            height: card_height,
+            ..area
+        };
+        frame.render_widget(Paragraph::new(band.card).block(block), card_area);
+    }
+    if !band.tasks.is_empty() && area.height > card_height {
+        let tasks_area = Rect {
+            y: area.y + card_height,
+            height: area.height - card_height,
+            ..area
+        };
+        frame.render_widget(Paragraph::new(band.tasks), tasks_area);
+    }
+}
+
+/// Build the pinned status band. Todos are shown briefly as a bordered card;
+/// completed tasks are shown briefly as confirmation, while running and failed
+/// tasks remain actionable.
+fn pinned_todo_band_lines(app: &dyn TuiState, width: u16, viewport_height: u16) -> PinnedTodoBand {
+    if width < 16 || viewport_height < 3 {
+        return PinnedTodoBand::default();
+    }
+
+    let tasks: Vec<_> = app
         .background_task_rows()
         .iter()
         .map(|task| active_background_task_line(task, width))
         .collect();
+    // Card content lives inside the border plus one column of padding per side.
+    let inner_width = width.saturating_sub(4);
+    let mut title = String::from(" Todos ");
     let card_lines = if crate::config::config().display.pin_todos {
         app.pinned_todos_payload()
             .map(|payload| {
-                let msg = crate::tui::DisplayMessage::todos(payload.to_string());
+                if let Some((done, total)) = super::messages::todo_payload_counts(payload) {
+                    title = format!(" Todos {}/{} ", done, total);
+                }
+                // Unboxed body: the band draws its own border below. Go through
+                // the shared message-line cache so an unchanged list is not
+                // re-rendered on every frame. The distinct title keeps this
+                // entry apart from the boxed inline card for the same payload.
+                let msg = crate::tui::DisplayMessage::todos(payload.to_string())
+                    .with_title("Todos (pinned body)");
                 super::messages::get_cached_message_lines(
                     &msg,
-                    width,
+                    inner_width,
                     app.diff_mode(),
-                    super::messages::render_todos_message,
+                    |msg, width, _| {
+                        super::messages::render_todo_card_body(&msg.content, width)
+                            .unwrap_or_default()
+                    },
                 )
             })
             .unwrap_or_default()
     } else {
         Vec::new()
     };
-    if card_lines.is_empty() && task_lines.is_empty() {
-        return (Vec::new(), None);
-    }
 
-    // Band budget: about a third of the viewport.
+    // Band budget: about a third of the viewport, including the two border
+    // rows around the card and the task rows below it.
     let budget = ((viewport_height as usize) / 3).clamp(2, 12);
-    let content_budget = budget.saturating_sub(task_lines.len()).max(2);
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let content_budget = budget.saturating_sub(tasks.len()).saturating_sub(2).max(2);
+    let mut card: Vec<Line<'static>> = Vec::new();
     let has_more = card_lines.len() > content_budget && !app.pinned_todos_expanded();
     let mut more_line = None;
     if has_more {
         let shown = content_budget.saturating_sub(1);
         let hidden = card_lines.len() - shown;
-        lines.extend(card_lines.into_iter().take(shown));
-        more_line = Some(lines.len());
-        lines.push(Line::from(Span::styled(
-            format!("  … +{} more (todo)", hidden),
+        card.extend(card_lines.into_iter().take(shown));
+        more_line = Some(card.len());
+        card.push(Line::from(Span::styled(
+            format!("… +{} more (todo)", hidden),
             Style::default().fg(dim_color()),
         )));
     } else {
-        lines.extend(card_lines);
+        card.extend(card_lines);
     }
-    lines.extend(task_lines);
-    (lines, more_line)
+    PinnedTodoBand {
+        card,
+        title,
+        more_line,
+        tasks,
+    }
 }
 
 fn active_background_task_line(task: &crate::tui::BackgroundTaskRow, width: u16) -> Line<'static> {
@@ -1512,6 +1634,82 @@ pub(crate) fn set_pinned_todo_more_area_for_test(area: Option<Rect>) {
 
 pub(crate) fn pinned_todo_more_area() -> Option<Rect> {
     PINNED_TODO_MORE_AREA.lock().ok().and_then(|area| *area)
+}
+
+/// Smallest chat viewport (rows) that still shows the "Jump to bottom" pill.
+/// Below this the 3-row box would hide too much of the transcript, and the
+/// `↓N` indicator is drawn instead.
+const JUMP_TO_BOTTOM_MIN_VIEWPORT_ROWS: u16 = 10;
+
+/// Screen rect and content line of the "Jump to bottom" pill, or `None` when
+/// it doesn't fit. The pill is a 3-row rounded box on the last rows of the
+/// chat viewport (directly above the input), centered in the chat column.
+/// Optional parts (line count, then key hint) are dropped when narrow.
+fn jump_to_bottom_pill_rect(
+    area: Rect,
+    top_band_lines: u16,
+    key_label: Option<&str>,
+    lines_below: usize,
+) -> Option<(Rect, Line<'static>)> {
+    const PILL_HEIGHT: u16 = 3;
+    if area.height < JUMP_TO_BOTTOM_MIN_VIEWPORT_ROWS
+        || area.height.saturating_sub(top_band_lines) < PILL_HEIGHT * 2
+    {
+        return None;
+    }
+    let key_span = key_label.map(|label| format!(" ({label})"));
+    let count = format!(
+        " · {lines_below} {} below",
+        if lines_below == 1 { "line" } else { "lines" }
+    );
+    let build = |with_key: bool, with_count: bool| -> Line<'static> {
+        let mut spans = vec![Span::styled(
+            "Jump to bottom",
+            Style::default().fg(accent_color()).bold(),
+        )];
+        if with_key && let Some(key) = &key_span {
+            spans.push(Span::styled(key.clone(), Style::default().fg(dim_color())));
+        }
+        spans.push(Span::styled(
+            " ↓",
+            Style::default().fg(accent_color()).bold(),
+        ));
+        if with_count {
+            spans.push(Span::styled(
+                count.clone(),
+                Style::default().fg(dim_color()),
+            ));
+        }
+        Line::from(spans)
+    };
+    // Border (2) + one space of padding on each side (2).
+    let chrome = 4u16;
+    let line = [(true, true), (true, false), (false, false)]
+        .into_iter()
+        .map(|(key, count)| build(key, count))
+        .find(|line| (line.width() as u16).saturating_add(chrome) <= area.width)?;
+    let width = (line.width() as u16).saturating_add(chrome);
+    let rect = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + area.height - PILL_HEIGHT,
+        width,
+        height: PILL_HEIGHT,
+    };
+    Some((rect, line))
+}
+
+static JUMP_TO_BOTTOM_AREA: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
+/// Publish the on-screen rect of the "Jump to bottom" pill for the mouse
+/// handler. `None` whenever the pill isn't drawn this frame.
+pub(crate) fn set_jump_to_bottom_area(area: Option<Rect>) {
+    if let Ok(mut current) = JUMP_TO_BOTTOM_AREA.lock() {
+        *current = area;
+    }
+}
+
+pub(crate) fn jump_to_bottom_area() -> Option<Rect> {
+    JUMP_TO_BOTTOM_AREA.lock().ok().and_then(|area| *area)
 }
 
 fn compute_prompt_preview_line_count(

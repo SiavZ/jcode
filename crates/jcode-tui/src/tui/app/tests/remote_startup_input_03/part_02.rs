@@ -134,6 +134,7 @@ fn test_initial_history_bootstrap_preserves_restored_interleave_state() {
                 provider_name: Some("claude".to_string()),
                 provider_model: Some("claude-sonnet-4-20250514".to_string()),
                 subagent_model: None,
+                agent_model_overrides: Default::default(),
                 autoreview_enabled: None,
                 autojudge_enabled: None,
                 available_models: vec![],
@@ -157,9 +158,11 @@ fn test_initial_history_bootstrap_preserves_restored_interleave_state() {
                 resolved_credential: None,
                 reasoning_effort: None,
                 service_tier: None,
+                account_labels: Vec::new(),
                 compaction_mode: crate::config::CompactionMode::Reactive,
                 activity: None,
                 side_panel: crate::side_panel::SidePanelSnapshot::default(),
+                applets: Default::default(),
             },
             &mut remote,
         );
@@ -200,6 +203,7 @@ fn test_initial_history_bootstrap_skips_resubmit_when_prompt_already_in_history(
             auto_retry: false,
             retry_attempts: 0,
             retry_at: None,
+            overload_attempts: 0,
         });
         app.save_input_for_reload(session_id);
 
@@ -226,6 +230,7 @@ fn test_initial_history_bootstrap_skips_resubmit_when_prompt_already_in_history(
                 provider_name: Some("claude".to_string()),
                 provider_model: Some("claude-sonnet-4-20250514".to_string()),
                 subagent_model: None,
+                agent_model_overrides: Default::default(),
                 autoreview_enabled: None,
                 autojudge_enabled: None,
                 available_models: vec![],
@@ -249,9 +254,11 @@ fn test_initial_history_bootstrap_skips_resubmit_when_prompt_already_in_history(
                 resolved_credential: None,
                 reasoning_effort: None,
                 service_tier: None,
+                account_labels: Vec::new(),
                 compaction_mode: crate::config::CompactionMode::Reactive,
                 activity: None,
                 side_panel: crate::side_panel::SidePanelSnapshot::default(),
+                applets: Default::default(),
             },
             &mut remote,
         );

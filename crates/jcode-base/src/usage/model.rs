@@ -198,11 +198,37 @@ pub struct OpenAIUsageData {
     pub seven_day: Option<OpenAIUsageWindow>,
     pub spark: Option<OpenAIUsageWindow>,
     pub hard_limit_reached: bool,
+    pub openai_reset_credits: Option<jcode_usage_types::OpenAiResetCredits>,
     pub fetched_at: Option<Instant>,
     pub last_error: Option<String>,
 }
 
 impl OpenAIUsageData {
+    /// Recommend a reset only with fresh, account-matched availability and an
+    /// actually reached limit. The general `exhausted` heuristic's 99% threshold
+    /// is useful for failover, but must not encourage spending a reset early.
+    pub fn banked_reset_available_for_account(&self, account_label: Option<&str>) -> bool {
+        if self.is_stale() || self.last_error.is_some() {
+            return false;
+        }
+        let Some(credits) = &self.openai_reset_credits else {
+            return false;
+        };
+        if credits.available_count == 0 || credits.account_label.as_deref() != account_label {
+            return false;
+        }
+        // OpenAI can report rounded 100% usage while still allowing requests.
+        // Conversely an enforced limit need not have a corresponding window.
+        if let Some(allowed) = credits.ordinary_usage_allowed {
+            return !allowed;
+        }
+        self.hard_limit_reached
+            || [self.five_hour.as_ref(), self.seven_day.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|window| window.usage_ratio >= 1.0)
+    }
+
     pub fn age_ms(&self) -> Option<u128> {
         self.fetched_at.map(|t| t.elapsed().as_millis())
     }
@@ -289,6 +315,33 @@ impl OpenAIUsageData {
 
     pub fn has_limits(&self) -> bool {
         self.five_hour.is_some() || self.seven_day.is_some() || self.spark.is_some()
+    }
+
+    /// True only when this snapshot positively shows ordinary usage is open
+    /// again: fetched without error, no hard limit, and either the explicit
+    /// `allowed` flag or every reported window clearly below its limit. Used
+    /// to drop a usage-limit mark after an early reset, so it must never
+    /// guess "available" from missing data.
+    pub fn confirms_usage_available(&self) -> bool {
+        if self.fetched_at.is_none() || self.last_error.is_some() || self.hard_limit_reached {
+            return false;
+        }
+        if let Some(allowed) = self
+            .openai_reset_credits
+            .as_ref()
+            .and_then(|credits| credits.ordinary_usage_allowed)
+        {
+            return allowed;
+        }
+        self.has_limits()
+            && [
+                self.five_hour.as_ref(),
+                self.seven_day.as_ref(),
+                self.spark.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .all(|window| window.usage_ratio < 0.99)
     }
 }
 

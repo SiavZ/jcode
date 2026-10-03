@@ -182,7 +182,14 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         "/help <command>",
         "Show details for one command",
     ));
-    lines.push(help_entry("/model", "List or switch models"));
+    lines.push(help_entry(
+        "/model",
+        "Browse models: search, Ctrl+P filters by provider",
+    ));
+    lines.push(help_entry(
+        "/model @<provider>",
+        "Browse one provider's models",
+    ));
     lines.push(help_entry("/model <name>", "Switch to a different model"));
     lines.push(help_entry(
         "/provider-test-coverage",
@@ -220,6 +227,10 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
     lines.push(help_entry("/config", "Show active configuration"));
     lines.push(help_entry("/config init", "Create default config file"));
     lines.push(help_entry("/config edit", "Open config in $EDITOR"));
+    lines.push(help_entry(
+        "/voice",
+        "Voice input: speak, then send (Ctrl+Space)",
+    ));
     lines.push(help_entry("/dictate", "Run configured external dictation"));
     lines.push(help_entry(
         "/git [status]",
@@ -237,6 +248,10 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
     lines.push(help_entry(
         "/keys",
         "Show keybinding conflicts with your terminal/OS",
+    ));
+    lines.push(help_entry(
+        "/reset usage limits openai",
+        "Review a banked reset, then confirm or cancel",
     ));
     lines.push(help_entry("/usage", "Show connected provider usage limits"));
     lines.push(help_entry(
@@ -291,6 +306,10 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
     lines.push(help_entry(
         "/refactor resume",
         "Resume the last saved refactor loop/plan",
+    ));
+    lines.push(help_entry(
+        "/side [on|off]",
+        "Show or hide the selected side-panel page",
     ));
     lines.push(help_entry(
         "/splitview [on|off|status]",
@@ -486,7 +505,11 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
     lines.push(Line::from(""));
     lines.push(key_entry(
         &crate::tui::keybind::side_panel_toggle_key_label(),
-        "Toggle side panel (or diagram pane if empty)",
+        "Cycle side panel: split, fullscreen, hidden",
+    ));
+    lines.push(key_entry(
+        &crate::tui::keybind::diagram_pane_visibility_key_label(),
+        "Show/hide diagram pane",
     ));
     lines.push(key_entry(&alt("T"), "Toggle diagram position (side/top)"));
     lines.push(key_entry(

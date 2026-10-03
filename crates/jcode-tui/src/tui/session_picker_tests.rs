@@ -1425,8 +1425,10 @@ fn onboarding_banner_renders_prompt_and_both_action_rows() {
         review_x < 50,
         "suggested prompt should span the visual center: {lines:#?}"
     );
+    let width = buffer.area.width as usize;
+    let start_end = lines[start_y].trim_end().chars().count();
     assert!(
-        start_y >= buffer.area.height as usize - 3 && start_x >= 95,
+        start_y >= buffer.area.height as usize - 3 && start_x > width / 2 && start_end + 4 >= width,
         "blank-session action should stay secondary in the bottom-right: {lines:#?}"
     );
 }
@@ -1991,7 +1993,7 @@ fn test_preview_sticky_prompt_header_appears_after_scrolling() {
     // confirm it carries the "N›" sticky-header marker.
     let preview_inner_x = (w as f32 * 0.40) as u16 + 1;
     let header_row: String = (preview_inner_x..w.saturating_sub(1))
-        .map(|x| buffer[(x, 1)].symbol())
+        .map(|x| buffer[(x, 2)].symbol()) // row 0: search bar, row 1: border
         .collect();
     assert!(
         header_row.contains('›'),
@@ -2069,7 +2071,7 @@ fn test_preview_sticky_prompt_header_survives_async_preview_load() {
 
     let preview_inner_x = (w as f32 * 0.40) as u16 + 1;
     let header_row: String = (preview_inner_x..w.saturating_sub(1))
-        .map(|x| buffer[(x, 1)].symbol())
+        .map(|x| buffer[(x, 2)].symbol()) // row 0: search bar, row 1: border
         .collect();
     assert!(
         header_row.contains('›'),
@@ -2599,3 +2601,6 @@ fn preview_without_search_has_no_highlight_and_scrolls_to_bottom() {
         "no search means no highlight color in preview"
     );
 }
+
+#[path = "session_picker_search_tests.rs"]
+mod search;
