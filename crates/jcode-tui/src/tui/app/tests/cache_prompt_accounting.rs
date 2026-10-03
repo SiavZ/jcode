@@ -415,6 +415,7 @@ fn history_refresh_same_session_clears_optimal_baseline() {
         provider_name: Some("OpenAI".to_string()),
         provider_model: Some("gpt-5.6".to_string()),
         subagent_model: None,
+        agent_model_overrides: Default::default(),
         autoreview_enabled: None,
         autojudge_enabled: None,
         available_models: vec![],
@@ -453,7 +454,11 @@ fn history_refresh_same_session_clears_optimal_baseline() {
     };
     app.handle_server_event(history(), &mut remote);
     record_live_cache_request(&mut app, 10_000, 0);
-    assert!(app.token_accounting.cache_next_optimal_input_tokens.is_some());
+    assert!(
+        app.token_accounting
+            .cache_next_optimal_input_tokens
+            .is_some()
+    );
     // Reconnect: History for the same session refreshes usage.
     app.handle_server_event(history(), &mut remote);
     assert_eq!(app.token_accounting.cache_next_optimal_input_tokens, None);
