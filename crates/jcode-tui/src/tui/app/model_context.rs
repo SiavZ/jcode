@@ -852,6 +852,17 @@ impl App {
         }
         self.restore_failed_input_to_box();
 
+        if error.starts_with("Invalid tool calls:") {
+            // The agent already used its schema-guided recovery attempts.
+            // Auto-poke must not start a new turn and reset that circuit breaker.
+            super::commands::disable_auto_poke(self);
+            self.overnight_auto_poke = None;
+            self.clear_pending_remote_retry();
+            self.push_display_message(DisplayMessage::error(error));
+            self.set_status_notice("Paused: invalid tool arguments");
+            return;
+        }
+
         if let Some(prompt) = crate::provider::parse_failover_prompt_message(&error) {
             self.handle_provider_failover_prompt(prompt);
             return;

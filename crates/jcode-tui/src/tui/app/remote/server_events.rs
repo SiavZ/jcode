@@ -1291,6 +1291,7 @@ pub(in crate::tui::app) fn handle_server_event(
             server_resumes,
         } => {
             app.refresh_openai_usage_after_quota_error(&message);
+            let invalid_tool_calls_exhausted = message.starts_with("Invalid tool calls:");
             // A server-initiated turn (scheduled task, swarm wake, DM) hit a
             // usage limit and the server will resume it at the reset. Settle
             // the adopted turn and say when it resumes. This client did not
@@ -1334,20 +1335,36 @@ pub(in crate::tui::app) fn handle_server_event(
                 );
                 return true;
             }
-            let reset_duration = retry_after_secs
-                .map(Duration::from_secs)
-                .or_else(|| parse_rate_limit_error(&message));
+            let reset_duration = (!invalid_tool_calls_exhausted)
+                .then(|| {
+                    retry_after_secs
+                        .map(Duration::from_secs)
+                        .or_else(|| parse_rate_limit_error(&message))
+                })
+                .flatten();
+            let previous_account_limit = app.turn_predates_credentials_change();
+            let rate_limit_retry_exhausted = reset_duration.is_some()
+                && !previous_account_limit
+                && app
+                    .rate_limit_pending_message
+                    .as_ref()
+                    .is_some_and(|pending| pending.retry_attempts >= App::AUTO_RETRY_MAX_ATTEMPTS);
             if let Some(reset_duration) = reset_duration {
                 // The limit was hit by a turn sent before the account changed,
                 // so it reports the previous account's reset time (possibly
                 // hours away). Resend now on the new credentials instead.
-                let previous_account_limit = app.turn_predates_credentials_change();
-                app.rate_limit_reset = Some(Instant::now() + reset_duration);
-                if let Some(is_system) = app
-                    .rate_limit_pending_message
-                    .as_ref()
-                    .map(|pending| pending.is_system)
+                if !rate_limit_retry_exhausted
+                    && let Some(pending) = app.rate_limit_pending_message.as_mut()
                 {
+                    // A stale reset timestamp or repeated 429 must not bypass
+                    // the normal retry budget forever. Carry this count through
+                    // begin_remote_send, just like other continuation retries.
+                    if previous_account_limit {
+                        pending.retry_attempts = 0;
+                    }
+                    pending.retry_attempts += 1;
+                    let is_system = pending.is_system;
+                    app.rate_limit_reset = Some(Instant::now() + reset_duration);
                     if previous_account_limit {
                         app.arm_account_change_resend(Instant::now());
                     } else {
@@ -1420,6 +1437,28 @@ pub(in crate::tui::app) fn handle_server_event(
                 app.clear_pending_remote_retry();
                 app.handle_provider_failover_prompt_with_resend(prompt, failed_fallback_payload);
                 return true;
+            }
+            if rate_limit_retry_exhausted || invalid_tool_calls_exhausted {
+                // Do not fall through to generic retry or turn-end auto-poke:
+                // either would immediately restart the exhausted hold loop.
+                crate::tui::app::commands::disable_auto_poke(app);
+                app.overnight_auto_poke = None;
+                app.clear_pending_remote_retry();
+                app.restore_failed_input_to_box();
+                if invalid_tool_calls_exhausted {
+                    app.push_display_message(DisplayMessage::system(
+                        "Paused because the model kept sending invalid tool arguments. Your progress is saved. Re-send the message or switch with /model.".to_string(),
+                    ));
+                    app.set_status_notice("Paused: invalid tool arguments");
+                } else {
+                    app.push_display_message(DisplayMessage::system(format!(
+                        "Rate-limit retry limit reached after {} automatic resumes. The provider still reports a limit. Your progress is saved. Wait for a valid reset, check the provider account, or switch with /model.",
+                        App::AUTO_RETRY_MAX_ATTEMPTS
+                    )));
+                    app.set_status_notice("Paused: provider limit did not clear");
+                }
+                app.offer_fallback_after_error_with_payload(&message, failed_fallback_payload);
+                return false;
             }
             // Connectivity failures (DNS, connection reset, no route, transient
             // TLS, timeouts) are always transient: the request never reached the
