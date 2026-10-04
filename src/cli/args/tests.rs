@@ -228,6 +228,9 @@ fn test_provider_choice_aliases_parse() {
     let args = Args::try_parse_from(["jcode", "--provider", "grok-build"]).unwrap();
     assert_eq!(args.provider, ProviderChoice::GrokBuild);
 
+    let args = Args::try_parse_from(["jcode", "--provider", "claude-code"]).unwrap();
+    assert_eq!(args.provider, ProviderChoice::ClaudeCode);
+
     let args = Args::try_parse_from(["jcode", "--provider", "cgc", "run", "smoke"]).unwrap();
     assert_eq!(args.provider, ProviderChoice::Comtegra);
 }
@@ -1272,4 +1275,41 @@ fn claude_login_oauth_flag_parses_and_conflicts_with_claude_code() {
         ])
         .is_err()
     );
+}
+
+#[test]
+fn claude_code_provider_and_login_parse() {
+    // `claude-code` is its own provider, never the native Claude choice.
+    let args = Args::try_parse_from(["jcode", "--provider", "claude-code", "run", "hi"]).unwrap();
+    assert_eq!(args.provider, ProviderChoice::ClaudeCode);
+    let args = Args::try_parse_from(["jcode", "--provider", "claude"]).unwrap();
+    assert_eq!(args.provider, ProviderChoice::Claude);
+
+    let args = Args::try_parse_from([
+        "jcode",
+        "login",
+        "--provider",
+        "claude-code",
+        "--account",
+        "personal",
+    ])
+    .unwrap();
+    // `login --provider X` sets the global provider (the dispatcher falls
+    // back to it when the positional is absent).
+    assert_eq!(args.provider, ProviderChoice::ClaudeCode);
+    match args.command {
+        Some(Command::Login { account, .. }) => {
+            assert_eq!(account.as_deref(), Some("personal"));
+        }
+        other => panic!("unexpected command: {:?}", other),
+    }
+
+    let args = Args::try_parse_from(["jcode", "login", "claude-code"]).unwrap();
+    assert!(matches!(
+        args.command,
+        Some(Command::Login {
+            provider: Some(ProviderChoice::ClaudeCode),
+            ..
+        })
+    ));
 }
