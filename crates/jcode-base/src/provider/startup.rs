@@ -209,7 +209,7 @@ impl MultiProvider {
                     cfg.providers.get(profile_name).map(|profile| {
                         external::OpenRouterRuntimeSpec::NamedProfile {
                             name: profile_name.to_string(),
-                            config: profile.clone(),
+                            config: Box::new(profile.clone()),
                         }
                     })
                 })

@@ -61,7 +61,7 @@ pub enum OpenRouterRuntimeSpec {
     /// (`[providers.<name>]` in config.toml).
     NamedProfile {
         name: String,
-        config: crate::config::NamedProviderConfig,
+        config: Box<crate::config::NamedProviderConfig>,
     },
 }
 

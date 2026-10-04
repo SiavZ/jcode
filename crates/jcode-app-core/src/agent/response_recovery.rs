@@ -710,9 +710,7 @@ mod malformed_tool_call_recovery_tests {
                 .expect("scripted rounds exhausted: turn made an unbounded request")
                 .clone();
             queue.remove(0);
-            Ok(Box::pin(futures::stream::iter(
-                events.into_iter().map(Ok),
-            )))
+            Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
         }
         fn name(&self) -> &str {
             "malformed-script-test"
