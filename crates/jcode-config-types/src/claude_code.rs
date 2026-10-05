@@ -24,7 +24,7 @@ pub const CLAUDE_CODE_BIN_ENV: &str = "JCODE_CLAUDE_CODE_BIN";
 pub struct ClaudeCodeConfig {
     /// Path to the `claude` binary, or a name resolved on `PATH`.
     pub binary: String,
-    /// Claude Code permission mode: default | acceptEdits | bypassPermissions | plan | auto.
+    /// Claude Code permission mode: default | acceptEdits | bypassPermissions | plan | auto | dontAsk.
     pub permission_mode: String,
     /// Value passed to `--setting-sources`.
     pub setting_sources: Vec<String>,
