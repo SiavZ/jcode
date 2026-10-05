@@ -219,6 +219,27 @@ pub fn register_external_provider_runtimes() {
         crate::provider::external::CLAUDE_CODE_RUNTIME,
         || std::sync::Arc::new(jcode_provider_claude_code_runtime::ClaudeCodeProvider::new()),
     );
+    crate::usage::register_claude_code_usage_probe(|instance| async move {
+        let settings = crate::auth::claude_code::settings();
+        let identity =
+            jcode_provider_claude_code_runtime::probe_instance(&settings, &instance).await?;
+        // An older CLI without `get_usage` still yields identity, just no windows.
+        let usage = identity.usage;
+        Ok(crate::usage::ClaudeCodeUsageProbe {
+            email: identity.email,
+            plan: identity.subscription,
+            limits_unavailable: usage.unavailable,
+            windows: usage
+                .windows
+                .into_iter()
+                .map(|w| crate::usage::ClaudeCodeUsageWindow {
+                    name: w.name,
+                    percent: w.percent,
+                    resets_at: w.resets_at,
+                })
+                .collect(),
+        })
+    });
     crate::provider::external::register_external_provider(
         crate::provider::external::GEMINI_RUNTIME,
         || std::sync::Arc::new(jcode_provider_gemini_runtime::GeminiProvider::new()),

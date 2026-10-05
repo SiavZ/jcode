@@ -149,6 +149,14 @@ def handle_host_control(msg):
         global model
         model = req.get("model", model)
         send({"type": "control_response", "response": {"subtype": "success", "request_id": rid, "response": {}}})
+    elif sub == "get_usage":
+        send({"type": "control_response", "response": {"subtype": "success", "request_id": rid, "response": {
+            "subscription_type": "max", "rate_limits_available": True,
+            "rate_limits": {"limits": [
+                {"kind": "session", "percent": 42, "resets_at": "2026-10-05T02:00:00+00:00", "scope": None},
+                {"kind": "weekly_all", "percent": 17, "resets_at": "2026-10-10T05:00:00+00:00", "scope": None},
+                {"kind": "weekly_scoped", "percent": 3, "resets_at": "2026-10-10T05:00:00+00:00",
+                 "scope": {"model": {"display_name": "Fable"}}}]}}}})
     else:
         send({"type": "control_response", "response": {"subtype": "error", "request_id": rid, "error": "unsupported"}})
 

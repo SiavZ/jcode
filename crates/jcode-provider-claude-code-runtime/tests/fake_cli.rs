@@ -550,6 +550,20 @@ async fn probe_reports_identity_without_a_prompt() {
     assert_eq!(identity.email.as_deref(), Some("fake@example.com"));
     assert_eq!(identity.subscription.as_deref(), Some("Claude Max"));
     assert_eq!(identity.models, vec!["claude-opus-5-5", "claude-sonnet-5"]);
+    let usage = identity.usage;
+    let windows: Vec<(&str, f32)> = usage
+        .windows
+        .iter()
+        .map(|w| (w.name.as_str(), w.percent))
+        .collect();
+    assert_eq!(
+        windows,
+        vec![
+            ("5-hour window", 42.0),
+            ("7-day window", 17.0),
+            ("7-day window (Fable)", 3.0)
+        ]
+    );
     // Cached: a second probe does not spawn again.
     provider
         .probe_identity(&ClaudeCodeInstance::implicit_default())
