@@ -186,6 +186,10 @@ struct SessionState {
     resume_id: Option<String>,
     /// Whether the current Claude session already saw this conversation.
     seeded: bool,
+    /// The agent's persisted resume id may only be used for the first child.
+    /// Once a child ran (or the instance changed), it names a session this
+    /// provider already moved past, possibly under another account.
+    hint_spent: bool,
 }
 
 /// Claude via the local Claude Code CLI.
@@ -377,10 +381,16 @@ impl ClaudeCodeProvider {
             child.shutdown().await;
         }
 
+        let hint = if state.hint_spent {
+            None
+        } else {
+            resume_hint.map(str::to_string)
+        };
+        state.hint_spent = true;
         let resume = state
             .resume_id
             .clone()
-            .or_else(|| resume_hint.map(str::to_string))
+            .or(hint)
             .filter(|id| uuid::Uuid::parse_str(id).is_ok());
         let launch_args = instance
             .launch_args
