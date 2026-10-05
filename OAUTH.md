@@ -142,7 +142,7 @@ default_provider = "claude-code"   # optional; otherwise pick a Claude Code rout
 
 [provider.claude_code]
 binary = "claude"                  # path or name on PATH (env: JCODE_CLAUDE_CODE_BIN)
-permission_mode = "default"        # default | acceptEdits | bypassPermissions | plan | auto
+permission_mode = "default"        # default | acceptEdits | bypassPermissions | plan | auto | dontAsk
 setting_sources = ["user", "project", "local"]
 expose_jcode_tools = true
 default_instance = "default"
@@ -173,13 +173,25 @@ with the email and plan Claude Code cached for each login; picking one pins it
 for the current window. Each non-default instance also appears in `/model` as
 its own route (`claude-code:<instance>`), so picking a route picks the account.
 
+`jcode usage` and `/usage` list one `Claude Code` entry per instance, with the
+5-hour, weekly and model-scoped weekly windows, the account email and the
+plan. jcode reads them from an init-only `claude` process (`get_usage`, no
+prompt, no tokens). Instances that resolve to the same account are listed once.
+A signed-out instance shows its own `claude auth login` command.
+
+Permissions: Claude Code still applies its own allow and deny rules. For a
+tool it would ask about, jcode answers using `permission_mode`. `default`,
+`acceptEdits`, `auto` and `bypassPermissions` allow it. `dontAsk` and `plan`
+deny it. `ExitPlanMode` always stops so the plan reaches you, and
+`AskUserQuestion` is turned into a normal reply.
+
 Limitations (first version):
+- No interactive per-tool approval prompt in jcode yet. Use `permission_mode`
+  and Claude Code's own permission rules.
 - No automatic same-provider failover between Claude Code instances yet.
 - jcode's `/compact` is not used; Claude Code compacts its own context.
 - Banked reset credits, history rewind/fork, Windows `.cmd` shims and Bedrock
   instances are not supported.
-- Per-instance usage windows are not shown in the usage panel yet; use
-  `claude` `/usage` for now.
 
 ## OpenAI / Codex OAuth
 
