@@ -129,10 +129,15 @@ a session picks one per turn.
 | Accounts | `claude-<n>` labels in `/account claude` | Instances from `[provider.claude_code]` in `/account claude-code` |
 | Model ids | `claude-opus-4-8`, `claude-oauth:...` | `claude-code:claude-opus-4-8` |
 
-Why use it: the subscription is used by the official Claude Code client itself,
-so requests come from the client Anthropic ships for subscription use rather
-than from a third-party transport. Check Anthropic's current terms for your
-plan. Native Claude stays the default and is unchanged.
+Why use it: Claude Code keeps the login, makes every request and runs its own
+agent loop, tools, hooks and `CLAUDE.md` handling. jcode never reads or stores
+the credential. Anthropic's terms are the user's responsibility here too: its
+legal and compliance page says subscription (Free/Pro/Max) OAuth is for Claude
+Code and Claude.ai, and names the Agent SDK as not permitted with those tokens.
+This mode drives the `claude` CLI over that same SDK protocol, so check the
+current terms before using a subscription login with it. An API-key login
+(`ANTHROPIC_API_KEY` in the instance `env`) avoids the question. Native Claude
+stays the default and is unchanged.
 
 Enable it:
 
