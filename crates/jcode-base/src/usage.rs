@@ -7,6 +7,7 @@ mod accessors;
 mod anthropic_reset;
 mod api_keys;
 mod cache;
+mod claude_code;
 mod disk_cache;
 mod display;
 mod model;
@@ -22,6 +23,9 @@ pub use anthropic_reset::{
 };
 use api_keys::enqueue_api_key_usage_tasks;
 use cache::*;
+pub use claude_code::{
+    ClaudeCodeUsageProbe, ClaudeCodeUsageWindow, register_claude_code_usage_probe,
+};
 pub use jcode_usage_types::{OpenAiResetCredits, ProviderUsage, ProviderUsageProgress, UsageLimit};
 pub use model::*;
 pub use openai_reset::{
@@ -258,6 +262,7 @@ where
         completed += 1;
         if let Ok(Some(report)) = joined {
             upsert_provider_usage(&mut results, report);
+            claude_code::dedupe_claude_code_by_email(&mut results);
         }
 
         on_update(ProviderUsageProgress {
@@ -357,6 +362,7 @@ fn enqueue_provider_usage_tasks(tasks: &mut tokio::task::JoinSet<Option<Provider
     total += enqueue_anthropic_usage_tasks(tasks);
     total += enqueue_openai_usage_tasks(tasks);
     total += enqueue_api_key_usage_tasks(tasks);
+    total += claude_code::enqueue_claude_code_usage_tasks(tasks);
 
     if openrouter_api_key().is_some() {
         tasks.spawn(async {
@@ -431,6 +437,10 @@ fn activity_source_has_dedicated_report(source_key: &str) -> bool {
     // Dual-auth and OAuth surfaces always reported above.
     if source_key.starts_with("claude:") || source_key.starts_with("openai:") {
         return true;
+    }
+    // Claude Code instances get a probe report while the CLI is installed.
+    if source_key == "claude-code" || source_key.starts_with("claude-code:") {
+        return crate::auth::claude_code::binary_available();
     }
     match source_key {
         "openrouter" => openrouter_api_key().is_some(),

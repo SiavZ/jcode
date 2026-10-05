@@ -18,6 +18,7 @@ pub mod prompt;
 pub mod settings;
 pub mod translate;
 pub mod turn;
+pub mod usage;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
@@ -45,6 +46,8 @@ pub const PROVIDER_NAME: &str = "claude-code";
 const PROBE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 /// Identity probe deadline.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(25);
+/// How long the probe waits for `get_usage` after `initialize` answered.
+const PROBE_USAGE_TIMEOUT: Duration = Duration::from_secs(8);
 /// One-shot (`complete_simple`) deadline.
 const ONESHOT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Model ids offered before the CLI reported its own list.
@@ -58,12 +61,120 @@ const FALLBACK_MODELS: &[&str] = &[
 ];
 
 /// Identity reported by an init-only probe.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ClaudeCodeIdentity {
     pub email: Option<String>,
     pub subscription: Option<String>,
     pub organization: Option<String>,
     pub models: Vec<String>,
+    /// Subscription usage windows from `get_usage`. `None` when the CLI does
+    /// not support the request or did not answer in time.
+    pub usage: Option<usage::ClaudeCodeUsage>,
+}
+
+/// Run an init-only probe child for `instance`: `initialize`, then
+/// `get_usage`. No prompt is written and no tokens are used. User hooks,
+/// remote MCP servers and IDE auto-connect are disabled for the probe.
+pub async fn probe_instance(
+    settings: &ClaudeCodeSettings,
+    instance: &ClaudeCodeInstance,
+) -> Result<ClaudeCodeIdentity> {
+    let mut command = tokio::process::Command::new(settings.resolved_binary());
+    command
+        .args(settings::build_probe_argv(&settings.setting_sources))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    for (k, v) in settings::instance_env(instance)
+        .into_iter()
+        .chain(settings::probe_env_extras())
+    {
+        command.env(k, v);
+    }
+    tokio::time::timeout(PROBE_TIMEOUT, async move {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let mut child = command.spawn().context("start Claude Code probe")?;
+        let mut stdin = child.stdin.take().context("probe stdin")?;
+        let stdout = child.stdout.take().context("probe stdout")?;
+        let request =
+            control::control_request("probe-init", control::initialize_request(false, ""));
+        stdin.write_all(format!("{request}\n").as_bytes()).await?;
+        stdin.flush().await?;
+        let mut identity: Option<ClaudeCodeIdentity> = None;
+        let mut lines = BufReader::new(stdout).lines();
+        let finish = |child: &mut tokio::process::Child| {
+            let _ = child.start_kill();
+        };
+        loop {
+            // After `initialize`, give `get_usage` a short window: older CLIs
+            // may not answer it at all.
+            let next = if identity.is_some() {
+                match tokio::time::timeout(PROBE_USAGE_TIMEOUT, lines.next_line()).await {
+                    Ok(line) => line?,
+                    Err(_) => None,
+                }
+            } else {
+                lines.next_line().await?
+            };
+            let Some(line) = next else {
+                finish(&mut child);
+                return identity
+                    .ok_or_else(|| anyhow!("Claude Code probe exited without answering"));
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if value.get("type").and_then(Value::as_str) != Some("control_response") {
+                continue;
+            }
+            let response = value.get("response");
+            let request_id = response
+                .and_then(|r| r.get("request_id"))
+                .and_then(Value::as_str);
+            let body = response
+                .and_then(|r| r.get("response"))
+                .unwrap_or(&Value::Null);
+            match request_id {
+                Some("probe-init") => {
+                    let info = InitInfo::from_response(body);
+                    identity = Some(ClaudeCodeIdentity {
+                        email: info.email.clone(),
+                        subscription: info.subscription.clone(),
+                        organization: info.organization.clone(),
+                        models: info.model_ids(),
+                        usage: None,
+                    });
+                    let usage_request = control::control_request(
+                        "probe-usage",
+                        serde_json::json!({"subtype": "get_usage"}),
+                    );
+                    stdin
+                        .write_all(format!("{usage_request}\n").as_bytes())
+                        .await?;
+                    stdin.flush().await?;
+                }
+                Some("probe-usage") => {
+                    let ok = response
+                        .and_then(|r| r.get("subtype"))
+                        .and_then(Value::as_str)
+                        == Some("success");
+                    if let Some(identity) = identity.as_mut()
+                        && ok
+                    {
+                        identity.usage = Some(usage::parse_get_usage(body));
+                    }
+                    drop(stdin);
+                    finish(&mut child);
+                    return identity
+                        .ok_or_else(|| anyhow!("Claude Code probe answered out of order"));
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("Claude Code probe timed out"))?
 }
 
 /// Per-session state: the live child and the Claude session it continues.
@@ -207,60 +318,7 @@ impl ClaudeCodeProvider {
         {
             return Ok(cached.clone());
         }
-        let settings = self.settings();
-        let mut command = tokio::process::Command::new(settings.resolved_binary());
-        command
-            .args(settings::build_probe_argv(&settings.setting_sources))
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        for (k, v) in settings::instance_env(instance)
-            .into_iter()
-            .chain(settings::probe_env_extras())
-        {
-            command.env(k, v);
-        }
-        let identity = tokio::time::timeout(PROBE_TIMEOUT, async move {
-            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-            let mut child = command.spawn().context("start Claude Code probe")?;
-            let mut stdin = child.stdin.take().context("probe stdin")?;
-            let stdout = child.stdout.take().context("probe stdout")?;
-            let request =
-                control::control_request("probe-init", control::initialize_request(false, ""));
-            stdin.write_all(format!("{request}\n").as_bytes()).await?;
-            stdin.flush().await?;
-            let mut lines = BufReader::new(stdout).lines();
-            while let Some(line) = lines.next_line().await? {
-                let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                let response = value.get("response");
-                if value.get("type").and_then(Value::as_str) == Some("control_response")
-                    && response
-                        .and_then(|r| r.get("request_id"))
-                        .and_then(Value::as_str)
-                        == Some("probe-init")
-                {
-                    drop(stdin);
-                    let _ = child.start_kill();
-                    let info = InitInfo::from_response(
-                        response
-                            .and_then(|r| r.get("response"))
-                            .unwrap_or(&Value::Null),
-                    );
-                    return Ok(ClaudeCodeIdentity {
-                        email: info.email.clone(),
-                        subscription: info.subscription.clone(),
-                        organization: info.organization.clone(),
-                        models: info.model_ids(),
-                    });
-                }
-            }
-            bail!("Claude Code probe exited without answering")
-        })
-        .await
-        .map_err(|_| anyhow!("Claude Code probe timed out"))??;
+        let identity = probe_instance(&self.settings(), instance).await?;
         let mut cache = self.probe_cache.lock().unwrap_or_else(|p| p.into_inner());
         cache.retain(|(k, _, _)| *k != key);
         cache.push((key, Instant::now(), identity.clone()));
