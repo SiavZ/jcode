@@ -550,7 +550,7 @@ async fn probe_reports_identity_without_a_prompt() {
     assert_eq!(identity.email.as_deref(), Some("fake@example.com"));
     assert_eq!(identity.subscription.as_deref(), Some("Claude Max"));
     assert_eq!(identity.models, vec!["claude-opus-5-5", "claude-sonnet-5"]);
-    let usage = identity.usage.expect("get_usage answered");
+    let usage = identity.usage;
     let windows: Vec<(&str, f32)> = usage
         .windows
         .iter()

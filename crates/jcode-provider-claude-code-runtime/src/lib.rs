@@ -67,9 +67,10 @@ pub struct ClaudeCodeIdentity {
     pub subscription: Option<String>,
     pub organization: Option<String>,
     pub models: Vec<String>,
-    /// Subscription usage windows from `get_usage`. `None` when the CLI does
-    /// not support the request or did not answer in time.
-    pub usage: Option<usage::ClaudeCodeUsage>,
+    /// Subscription usage windows from `get_usage`. Empty with
+    /// `answered == false` when the CLI does not support the request or did
+    /// not answer in time.
+    pub usage: usage::ClaudeCodeUsage,
 }
 
 /// Run an init-only probe child for `instance`: `initialize`, then
@@ -143,7 +144,7 @@ pub async fn probe_instance(
                         subscription: info.subscription.clone(),
                         organization: info.organization.clone(),
                         models: info.model_ids(),
-                        usage: None,
+                        usage: usage::ClaudeCodeUsage::default(),
                     });
                     let usage_request = control::control_request(
                         "probe-usage",
@@ -162,7 +163,7 @@ pub async fn probe_instance(
                     if let Some(identity) = identity.as_mut()
                         && ok
                     {
-                        identity.usage = Some(usage::parse_get_usage(body));
+                        identity.usage = usage::parse_get_usage(body);
                     }
                     drop(stdin);
                     finish(&mut child);

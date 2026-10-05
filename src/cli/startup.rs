@@ -214,7 +214,8 @@ pub fn register_external_provider_runtimes() {
         let settings = crate::auth::claude_code::settings();
         let identity =
             jcode_provider_claude_code_runtime::probe_instance(&settings, &instance).await?;
-        let usage = identity.usage.unwrap_or_default();
+        // An older CLI without `get_usage` still yields identity, just no windows.
+        let usage = identity.usage;
         Ok(crate::usage::ClaudeCodeUsageProbe {
             email: identity.email,
             plan: identity.subscription,
