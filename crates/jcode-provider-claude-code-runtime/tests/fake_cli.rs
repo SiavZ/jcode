@@ -517,6 +517,74 @@ async fn model_switch_uses_set_model_and_instance_switch_restarts() {
 }
 
 #[tokio::test]
+async fn instance_switch_ignores_the_agents_stale_resume_id() {
+    // The agent keeps passing the last SessionId it saw as
+    // resume_session_id. After switching accounts that id belongs to the old
+    // instance and must not be resumed under the new one.
+    let fake = Fake::new();
+    let other_home = fake.root.join("personal");
+    let provider = ClaudeCodeProvider::with_settings(ClaudeCodeSettings {
+        instances: vec![
+            ClaudeCodeInstance {
+                id: "default".into(),
+                ..ClaudeCodeInstance::default()
+            },
+            ClaudeCodeInstance {
+                id: "personal".into(),
+                home: Some(other_home.display().to_string()),
+                ..ClaudeCodeInstance::default()
+            },
+        ],
+        ..fake.settings()
+    });
+    let first = run_turn(&provider, &[Message::user("session")], None).await;
+    let old_session = text(&first).trim_start_matches("session:new:").to_string();
+    provider
+        .set_account_pin(
+            AccountProviderKind::ClaudeCode,
+            Some(AccountPin::new("personal", None)),
+        )
+        .unwrap();
+    let history = [
+        Message::user("session"),
+        Message::assistant_text(&text(&first)),
+        Message::user("echo-prompt"),
+    ];
+    let mut stream = provider
+        .complete(&history, &tools(), SYSTEM, Some(&old_session))
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Ok(Some(item)) = tokio::time::timeout(Duration::from_secs(20), stream.next()).await {
+        let event = item.unwrap();
+        let done = matches!(event, StreamEvent::MessageEnd { .. });
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+    let launches = fake.launches();
+    assert_eq!(launches.len(), 2);
+    let argv: Vec<&str> = launches[1]["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        !argv.iter().any(|a| a.starts_with("--resume=")),
+        "new account must not resume the old account's session: {argv:?}"
+    );
+    assert!(argv.iter().any(|a| a.starts_with("--session-id=")));
+    // The new session gets the conversation so far.
+    assert!(
+        text(&events).contains("previous_conversation"),
+        "{events:?}"
+    );
+    provider.shutdown().await;
+}
+
+#[tokio::test]
 async fn complete_simple_uses_a_one_shot_child() {
     let fake = Fake::new();
     let provider = fake.provider();
