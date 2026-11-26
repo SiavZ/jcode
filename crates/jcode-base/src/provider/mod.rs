@@ -1,5 +1,5 @@
 mod accessors;
-mod account_failover;
+pub(crate) mod account_failover;
 mod account_selection;
 pub mod activation;
 pub mod anthropic;

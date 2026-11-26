@@ -57,6 +57,40 @@ fn registered_probe() -> Option<ProbeFn> {
         .clone()
 }
 
+/// Poll only a held instance, coalescing attempts and preserving a five-minute floor.
+pub(super) async fn refresh_recovery(label: &str) {
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    static ATTEMPTS: OnceLock<tokio::sync::Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    let Some(probe) = registered_probe() else {
+        return;
+    };
+    let Some(instance) = crate::auth::claude_code::instance(label) else {
+        return;
+    };
+    let started = Instant::now();
+    {
+        let mut attempts = ATTEMPTS.get_or_init(Default::default).lock().await;
+        if attempts
+            .get(label)
+            .is_some_and(|at| at.elapsed() < super::CACHE_DURATION)
+        {
+            return;
+        }
+        attempts.insert(label.to_string(), started);
+    }
+    if let Ok(Ok(usage)) = tokio::time::timeout(Duration::from_secs(20), probe(instance)).await
+        && !usage.limits_unavailable
+        && !usage.windows.is_empty()
+        && usage
+            .windows
+            .iter()
+            .all(|window| window.percent.is_finite() && (0.0..99.0).contains(&window.percent))
+    {
+        super::recovery::record_available("claude-code", label, started);
+    }
+}
+
 /// `/usage` title for an instance.
 pub(super) fn report_name(instance: &ClaudeCodeInstanceConfig, is_default: bool) -> String {
     match instance.display_name.as_deref().map(str::trim) {

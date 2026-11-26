@@ -9,7 +9,8 @@
 //!
 //! Policy (shared with `jcode_provider_core::usage_limit_resume`):
 //! - Resume at the reported reset plus 5-30 s of jitter, or when the account
-//!   changes. With several resets (multi-account), the earliest wins.
+//!   changes, or a fresh usage probe confirms headroom before that reset.
+//!   With several resets (multi-account), the earliest wins.
 //! - A reset in the past waits 60 s, an unknown reset waits 15 min. Never zero.
 //! - At most [`MAX_USAGE_LIMIT_RESUMES`] resumes per turn, then the turn fails.
 //! - A user message or cancellation request cancels its pending resume.
@@ -376,6 +377,26 @@ pub(super) fn has_pending_resume(session_id: &str) -> bool {
         }
 }
 
+pub(super) fn recovery_account(agent: &Agent) -> Option<(String, String)> {
+    let kind = crate::provider::AccountProviderKind::from_key(&agent.provider_name())?;
+    let provider = agent.provider_handle();
+    if kind != crate::provider::AccountProviderKind::ClaudeCode
+        && !matches!(
+            provider.active_resolved_credential(),
+            Some(jcode_provider_core::ResolvedCredential::Oauth)
+        )
+        && provider.credential_mode() != jcode_provider_core::CredentialMode::OAuth
+    {
+        return None;
+    }
+    let account = crate::session_accounts::account_info_with_pins(
+        provider.as_ref(),
+        agent.account_pins(),
+        kind,
+    );
+    Some((kind.key().to_string(), account.label?))
+}
+
 impl ResumeTicket {
     fn is_current(&self) -> bool {
         !self.token.is_cancelled()
@@ -407,6 +428,37 @@ impl ResumeTicket {
             _ = self.token.cancelled() => false,
             _ = self.resume_now.notified() => !self.token.is_cancelled(),
             _ = tokio::time::sleep(delay) => !self.token.is_cancelled(),
+        }
+    }
+
+    async fn wait_with_usage_checks(
+        &self,
+        delay: Duration,
+        account: Option<(String, String)>,
+        since: i64,
+    ) -> bool {
+        // Keep the usage HTTP futures off each turn runner's stack.
+        let probe = Box::pin(async {
+            let Some((provider, label)) = account else {
+                return std::future::pending::<()>().await;
+            };
+            loop {
+                if provider == "claude-code" {
+                    crate::usage::refresh_usage_limit_recovery(&provider, &label).await;
+                } else {
+                    super::account_usage::refresh_for_provider_wait().await;
+                }
+                if crate::usage::confirmed_available_at(&provider, &label)
+                    .is_some_and(|checked_at| checked_at > since)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+        tokio::select! {
+            ready = self.wait(delay) => ready,
+            _ = probe => !self.token.is_cancelled(),
         }
     }
 }
@@ -668,6 +720,7 @@ async fn resume_turn_after_usage_limit_inner(
     let mut restored = restored;
     let mut persisted = restored.is_some();
     loop {
+        let wait_started = Utc::now().timestamp_millis();
         let decision = if let Some(state) = restored.take() {
             restored_decision(&state, Utc::now())
         } else {
@@ -791,12 +844,20 @@ async fn resume_turn_after_usage_limit_inner(
         } else {
             announce_wait.await;
         }
+        let account = if plan.kind == ResumeKind::UsageLimit {
+            match held.as_deref() {
+                Some(agent) => recovery_account(agent),
+                None => recovery_account(&*agent.lock().await),
+            }
+        } else {
+            None
+        };
         // Let the user use the session while this turn waits.
         drop(held.take());
 
         if ticket
             .run_if_current(crate::runtime_activity::wait_without_activity(
-                ticket.wait(plan.delay),
+                ticket.wait_with_usage_checks(plan.delay, account, wait_started),
             ))
             .await
             != Some(true)

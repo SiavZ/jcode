@@ -22,6 +22,7 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 /// usage-limit error (reset `reset_in` away), then streams a reply.
 #[derive(Clone)]
 struct UsageLimitedProvider {
+    name: &'static str,
     limited_calls: usize,
     reset_in: Option<Duration>,
     calls: Arc<AtomicUsize>,
@@ -31,6 +32,7 @@ struct UsageLimitedProvider {
 impl UsageLimitedProvider {
     fn new(limited_calls: usize, reset_in: Option<Duration>) -> Self {
         Self {
+            name: "Claude",
             limited_calls,
             reset_in,
             calls: Arc::new(AtomicUsize::new(0)),
@@ -132,12 +134,72 @@ impl Provider for UsageLimitedProvider {
     }
 
     fn name(&self) -> &str {
-        "Claude"
+        self.name
     }
 
     fn fork(&self) -> Arc<dyn Provider> {
         Arc::new(self.clone())
     }
+}
+
+#[tokio::test]
+async fn usage_limit_recovery_resumes_server_turn_without_waiting_for_the_old_reset() {
+    let _sandbox = crate::auth::test_sandbox::AuthTestSandbox::new().unwrap();
+    crate::config::invalidate_config_cache();
+    let probed = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let probe_seen = probed.clone();
+    let probe_release = release.clone();
+    crate::usage::register_claude_code_usage_probe(move |_| {
+        let probed = probe_seen.clone();
+        let release = probe_release.clone();
+        async move {
+            probed.notify_one();
+            release.notified().await;
+            Ok(crate::usage::ClaudeCodeUsageProbe {
+                windows: vec![crate::usage::ClaudeCodeUsageWindow {
+                    name: "5-hour window".into(),
+                    percent: 0.0,
+                    resets_at: None,
+                }],
+                ..Default::default()
+            })
+        }
+    });
+    let mut provider = UsageLimitedProvider::new(1, Some(Duration::from_secs(5 * 3600)));
+    provider.name = "claude-code";
+    let mut fx = Fixture::new(&provider).await;
+    fx.start_scheduled_turn().await;
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), fx.next_terminal())
+            .await
+            .unwrap(),
+        ServerEvent::Error {
+            server_resumes: true,
+            ..
+        }
+    ));
+    tokio::time::timeout(Duration::from_secs(5), probed.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        provider.calls(),
+        1,
+        "usage checks must not open another turn"
+    );
+    release.notify_one();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), fx.next_terminal())
+            .await
+            .unwrap(),
+        ServerEvent::Done { id: 0 }
+    ));
+    assert_eq!(provider.calls(), 2);
+    assert!(provider.gaps()[0] < Duration::from_secs(60));
+    assert_eq!(scheduled_messages(&*fx.agent.lock().await), 1);
+    assert!(!usage_limit_resume::has_pending_resume(&fx.session_id));
+    crate::usage::register_claude_code_usage_probe(|_| async { anyhow::bail!("no test probe") });
+    crate::config::invalidate_config_cache();
 }
 
 struct Fixture {

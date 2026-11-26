@@ -109,6 +109,14 @@ async fn saved_account_usage_uses_target_headers_without_changing_active_account
     assert_eq!(report.limits.len(), 2);
     assert_eq!(report.limits[0].usage_percent, 25.0);
     assert_eq!(report.limits[1].usage_percent, 75.0);
+    let confirmed =
+        confirmed_available_at("openai", "usage-target").expect("live probe confirms recovery");
+    let _cached_report = fetch_saved_account_usage("openai", "usage-target").await;
+    assert_eq!(
+        confirmed_available_at("openai", "usage-target"),
+        Some(confirmed),
+        "cached display data must not re-confirm recovery"
+    );
     assert!(
         report
             .extra_info

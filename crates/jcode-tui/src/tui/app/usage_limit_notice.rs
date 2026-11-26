@@ -15,6 +15,100 @@ use super::{App, DisplayMessage, ProcessingStatus};
 use std::time::{Duration, Instant};
 
 impl App {
+    pub(super) fn watch_usage_limit_recovery(&mut self) {
+        self.usage_reset.limit_probe_at = None;
+        self.usage_reset.limit_wait = self
+            .rate_limit_reset
+            .map(|reset| (reset, chrono::Utc::now().timestamp_millis()));
+    }
+
+    pub(super) fn resume_after_usage_recovery(
+        &mut self,
+        provider: &str,
+        account_label: &str,
+        checked_at_unix_ms: i64,
+    ) -> bool {
+        let Some((reset, since)) = self.usage_reset.limit_wait else {
+            return false;
+        };
+        if self.rate_limit_reset != Some(reset)
+            || checked_at_unix_ms <= since
+            || self.is_processing
+            || matches!(self.status, ProcessingStatus::WaitingForNetwork { .. })
+            || (self.is_remote && self.rate_limit_pending_message.is_none())
+        {
+            return false;
+        }
+        let Some(kind) = crate::provider::AccountProviderKind::from_key(provider) else {
+            return false;
+        };
+        if self
+            .held_turn_provider_name()
+            .as_deref()
+            .and_then(crate::provider::AccountProviderKind::from_key)
+            != Some(kind)
+        {
+            return false;
+        }
+        let label = if self.is_remote {
+            self.remote_provider_oauth_account_label.clone()
+        } else {
+            crate::session_accounts::account_info(self.provider.as_ref(), kind).label
+        };
+        if label.as_deref() != Some(account_label) {
+            return false;
+        }
+        let now = Instant::now();
+        if let Some(pending) = self.rate_limit_pending_message.as_mut() {
+            pending.retry_at = Some(now);
+        }
+        self.rate_limit_reset = Some(now);
+        self.account_change_resend_at = Some(now);
+        self.usage_reset.limit_wait = None;
+        self.usage_reset.openai_quota_rejected = false;
+        self.push_display_message(DisplayMessage::system(
+            "Usage available again. Resuming the held turn.".to_string(),
+        ));
+        self.set_status_notice("Usage available; resuming");
+        true
+    }
+
+    pub(super) fn poll_local_usage_limit_recovery(&mut self) -> bool {
+        if self.is_remote || self.usage_reset.limit_wait.is_none() {
+            return false;
+        }
+        if self.usage_reset.limit_wait.map(|(reset, _)| reset) != self.rate_limit_reset {
+            self.usage_reset.limit_wait = None;
+            return false;
+        }
+        if self
+            .usage_reset
+            .limit_probe_at
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(30))
+            && let Some(kind) = self
+                .held_turn_provider_name()
+                .as_deref()
+                .and_then(crate::provider::AccountProviderKind::from_key)
+            && let Some(label) =
+                crate::session_accounts::account_info(self.provider.as_ref(), kind).label
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            self.usage_reset.limit_probe_at = Some(Instant::now());
+            runtime.spawn(async move {
+                crate::usage::refresh_usage_limit_recovery(kind.key(), &label).await;
+            });
+        }
+        crate::usage::confirmed_available_accounts()
+            .into_iter()
+            .any(|recovery| {
+                self.resume_after_usage_recovery(
+                    &recovery.provider,
+                    &recovery.account_label,
+                    recovery.checked_at_unix_ms,
+                )
+            })
+    }
+
     /// Quota errors without a reset keep their failed turn in the fallback
     /// offer. A confirmed account change can resend it on the selected account.
     pub(super) fn resume_after_confirmed_account_change(
@@ -98,6 +192,7 @@ impl App {
         // do not also restore it to the input box.
         self.last_submitted_input = None;
         self.rate_limit_reset = Some(Instant::now() + wait);
+        self.watch_usage_limit_recovery();
         let (notice, nudged) = self.rate_limit_notice_with_nudge(wait.as_secs());
         self.push_display_message(DisplayMessage::error(error.to_string()));
         self.push_display_message(DisplayMessage::system(notice));

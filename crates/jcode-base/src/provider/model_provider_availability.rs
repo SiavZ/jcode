@@ -161,9 +161,16 @@ fn is_quota_failure(reason: &str) -> bool {
     {
         return false;
     }
-    ["quota", "usage_limit", "usage limit", "usage exhausted"]
-        .iter()
-        .any(|needle| lower.contains(needle))
+    [
+        "quota",
+        "usage_limit",
+        "usage limit",
+        "usage exhausted",
+        "out of usage",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+        || jcode_provider_core::classify_account_usage_limit(reason).is_some()
 }
 
 /// Clear the quota cooldown for the exact OpenAI account that was reset, even
@@ -379,6 +386,8 @@ mod quota_recovery_tests {
             "usage_limit_reached",
             "usage limit reached",
             "quota exhausted",
+            "account is out of usage",
+            "[account-usage-limit resets_at=4000000000]",
         ] {
             assert!(is_quota_failure(reason), "{reason}");
         }

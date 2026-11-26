@@ -925,6 +925,27 @@ async fn account_usage_poll_sends_once_and_filters_control_done() {
 }
 
 #[tokio::test]
+async fn account_usage_poll_keeps_checking_an_unfocused_usage_limit_hold() {
+    let mut remote = RemoteConnection::dummy();
+    let peer = remote.take_dummy_peer().unwrap();
+    let (reader, _writer) = peer.into_split();
+    let mut reader = BufReader::new(reader);
+    remote.last_account_usage_poll = Some(Instant::now() - Duration::from_secs(60));
+    remote
+        .poll_account_usage_for_focus(false, true)
+        .await
+        .unwrap();
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(request["type"], "account_usage");
+    assert_eq!(request["recovery"], true);
+}
+
+#[tokio::test]
 async fn request_send_does_not_block_ui_when_server_stops_reading() {
     // Regression: the TUI awaited socket writes inline, so when the daemon's
     // receive buffer filled while it was blocked writing to us, the UI loop

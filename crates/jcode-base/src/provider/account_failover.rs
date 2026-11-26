@@ -245,6 +245,7 @@ struct AccountExhaustion {
     resets_at: Option<i64>,
     /// When it was recorded (used when `resets_at` is unknown).
     recorded_at: i64,
+    observed_at: std::time::Instant,
     /// Credential fingerprint of the login that ran out (see
     /// [`account_fingerprint`]). A different login later stored under the
     /// same label (relogin, relabel) is another subscription and must not
@@ -315,6 +316,7 @@ pub(crate) fn record_account_exhausted(
             generation,
             resets_at,
             recorded_at: now,
+            observed_at: std::time::Instant::now(),
             fingerprint,
         },
     );
@@ -338,6 +340,21 @@ pub(crate) fn clear_account_exhausted(kind: AccountProviderKind, label: &str) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(&(kind, label.to_string()));
+}
+
+pub(crate) fn clear_account_exhausted_before(
+    kind: AccountProviderKind,
+    label: &str,
+    probe_started: std::time::Instant,
+) {
+    let mut ledger = ACCOUNT_EXHAUSTION.lock().unwrap_or_else(|p| p.into_inner());
+    let key = (kind, label.to_string());
+    if ledger
+        .get(&key)
+        .is_some_and(|entry| entry.observed_at <= probe_started)
+    {
+        ledger.remove(&key);
+    }
 }
 
 /// Live ledger entry for `label`: dropped once its reset passed, or when the

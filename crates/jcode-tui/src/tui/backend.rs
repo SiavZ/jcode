@@ -915,13 +915,17 @@ impl RemoteConnection {
     /// Request account quotas from the daemon, never from the render thread.
     /// The daemon shares in-flight fetches and applies provider retry backoff.
     pub async fn poll_account_usage(&mut self) -> Result<()> {
-        self.poll_account_usage_for_focus(true).await
+        self.poll_account_usage_for_focus(true, false).await
     }
 
     /// Periodic poll from the tick loop, paced by whether the window is focused.
-    pub async fn poll_account_usage_for_focus(&mut self, focused: bool) -> Result<()> {
+    pub async fn poll_account_usage_for_focus(
+        &mut self,
+        focused: bool,
+        recovery: bool,
+    ) -> Result<()> {
         let now = Instant::now();
-        let interval = account_usage_poll_interval(focused);
+        let interval = account_usage_poll_interval(focused || recovery);
         if !account_usage_poll_due(self.last_account_usage_poll, now, interval) {
             return Ok(());
         }
@@ -929,7 +933,8 @@ impl RemoteConnection {
         self.last_account_usage_poll = Some(now);
         let id = self.next_request_id;
         self.next_request_id += 1;
-        self.send_request(Request::AccountUsage { id }).await
+        self.send_request(Request::AccountUsage { id, recovery })
+            .await
     }
 
     /// Resume a specific session by ID

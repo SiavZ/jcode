@@ -600,7 +600,11 @@ pub enum Request {
 
     /// Fetch daemon-owned OAuth account usage without acquiring the agent lock.
     #[serde(rename = "account_usage")]
-    AccountUsage { id: u64 },
+    AccountUsage {
+        id: u64,
+        #[serde(default, skip_serializing_if = "is_false")]
+        recovery: bool,
+    },
 
     /// Switch active Anthropic account label on the server session.
     /// This keeps account overrides and provider credential caches in sync.
@@ -1042,7 +1046,9 @@ pub enum Request {
 }
 
 mod events;
-pub use events::{AccountUsageSnapshot, AccountUsageWindow, ServerEvent, TurnIdentity};
+pub use events::{
+    AccountUsageRecovery, AccountUsageSnapshot, AccountUsageWindow, ServerEvent, TurnIdentity,
+};
 
 impl std::fmt::Debug for Request {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

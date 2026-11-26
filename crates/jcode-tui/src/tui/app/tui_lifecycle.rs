@@ -243,7 +243,7 @@ impl App {
         true
     }
 
-    fn held_turn_provider_name(&self) -> Option<String> {
+    pub(super) fn held_turn_provider_name(&self) -> Option<String> {
         if let Some(name) = self.remote_provider_name.clone() {
             return Some(name);
         }

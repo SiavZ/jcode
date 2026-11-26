@@ -197,7 +197,7 @@ impl RemoteConnection {
             | Request::GetHistory { id }
             | Request::ResumeSession { id, .. }
             | Request::GetModelCatalog { id, .. }
-            | Request::AccountUsage { id }
+            | Request::AccountUsage { id, .. }
             | Request::GetState { id } => Some(*id),
             _ => None,
         };

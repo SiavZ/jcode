@@ -225,6 +225,7 @@ fn test_user_typed_remote_turn_with_usage_limit_is_held_until_the_reset() {
             .rate_limit_reset
             .expect("turn held for a resend at the reset");
         let wait = reset.saturating_duration_since(Instant::now());
+        assert!(app.usage_reset.limit_wait.is_some(), "held usage limits must watch for early recovery");
         assert!(
             wait > Duration::from_secs(40 * 60 - 60) && wait <= Duration::from_secs(40 * 60),
             "{retry_after_secs:?}: {wait:?}"
@@ -236,6 +237,58 @@ fn test_user_typed_remote_turn_with_usage_limit_is_held_until_the_reset() {
             Some("finish the refactor")
         );
         assert!(!app.is_processing);
+    }
+}
+
+#[test]
+fn test_usage_limit_recovery_releases_only_a_fresh_matching_held_turn() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    for provider in ["openai", "claude", "claude-code"] {
+        let mut app = create_test_app();
+        app.is_remote = true;
+        app.remote_provider_name = Some(provider.into());
+        app.remote_provider_oauth_account_label = Some("held-account".into());
+        app.input = "keep my draft".into();
+        app.rate_limit_pending_message = Some(PendingRemoteMessage {
+            jarvis_voice: false,
+            content: "finish my task".into(),
+            images: vec![],
+            is_system: false,
+            system_reminder: None,
+            auto_retry: false,
+            retry_attempts: 2,
+            overload_attempts: 0,
+            retry_at: None,
+        });
+        let reset = Instant::now() + Duration::from_secs(5 * 3600);
+        app.rate_limit_reset = Some(reset);
+        app.watch_usage_limit_recovery();
+        let since = app.usage_reset.limit_wait.unwrap().1;
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        let event = |label: &str, at| crate::protocol::ServerEvent::AccountUsage {
+            id: 0,
+            anthropic: vec![],
+            openai: vec![],
+            recoveries: vec![crate::protocol::AccountUsageRecovery {
+                provider: provider.into(),
+                account_label: label.into(),
+                checked_at_unix_ms: at,
+            }],
+        };
+        app.handle_server_event(event("other-account", since + 1), &mut remote);
+        app.handle_server_event(event("held-account", since), &mut remote);
+        assert_eq!(app.rate_limit_reset, Some(reset));
+        assert!(!app.resume_after_usage_recovery("gemini", "held-account", since + 1));
+        app.handle_server_event(event("held-account", since + 1), &mut remote);
+        assert!(app.rate_limit_reset.unwrap() <= Instant::now());
+        let pending = app.rate_limit_pending_message.as_ref().unwrap();
+        assert!(pending.retry_at.unwrap() <= Instant::now());
+        assert_eq!(pending.retry_attempts, 2);
+        assert_eq!(pending.content, "finish my task");
+        assert_eq!(app.input, "keep my draft");
+        assert!(app.usage_reset.limit_wait.is_none());
+        assert!(!app.resume_after_usage_recovery(provider, "held-account", since + 2));
     }
 }
 

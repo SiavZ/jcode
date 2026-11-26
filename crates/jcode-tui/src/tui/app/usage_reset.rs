@@ -132,6 +132,8 @@ pub(super) struct ResetState<P = Pending> {
     cancelled: bool,
     redeem_account: Option<String>,
     pub(super) refresh_usage: bool,
+    pub(super) limit_wait: Option<(std::time::Instant, i64)>,
+    pub(super) limit_probe_at: Option<std::time::Instant>,
     /// A request rejection outranks a usage endpoint still reporting headroom.
     pub(super) openai_quota_rejected: bool,
     quota_refresh: Option<oneshot::Receiver<()>>,
@@ -150,6 +152,8 @@ impl<P> Default for ResetState<P> {
             cancelled: false,
             redeem_account: None,
             refresh_usage: false,
+            limit_wait: None,
+            limit_probe_at: None,
             openai_quota_rejected: false,
             quota_refresh: None,
             invalidate_account: None,

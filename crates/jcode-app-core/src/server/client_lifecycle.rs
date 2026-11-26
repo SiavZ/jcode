@@ -2369,8 +2369,8 @@ server_resumes: false,
                 .await;
             }
 
-            Request::AccountUsage { id } => {
-                super::account_usage::request(id, client_event_tx.clone());
+            Request::AccountUsage { id, recovery } => {
+                super::account_usage::request_for_session(id, client_event_tx.clone(), &agent, recovery);
             }
 
             Request::InvalidateOpenAiUsage { id, account_label } => {

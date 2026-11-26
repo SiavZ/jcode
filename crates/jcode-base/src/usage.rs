@@ -27,7 +27,11 @@ mod openai_reset;
 pub(crate) use openai_reset::auto_reset_weekly_usage;
 mod provider_fetch;
 use accessors::set_active_usage_key;
+mod recovery;
 mod remote_accounts;
+pub use recovery::{
+    confirmed_available_accounts, confirmed_available_at, refresh_usage_limit_recovery,
+};
 mod startup_snapshot;
 pub use accessors::*;
 pub use anthropic_reset::{
@@ -346,11 +350,7 @@ async fn fetch_anthropic_usage_data_uncached(
             .chain(usage.model_scoped.iter().map(|window| window.utilization))
             .all(|ratio| ratio.is_finite() && (0.0..0.99).contains(&ratio))
     {
-        crate::provider::models::clear_quota_unavailability_observed_before(
-            "claude",
-            label,
-            probe_started,
-        );
+        recovery::record_available("claude", label, probe_started);
     }
     let usage = disk_cache::store_success_with_reset_status(&cache_key, &usage, Some(reset_status));
     store_anthropic_usage(cache_key, usage.clone());

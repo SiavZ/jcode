@@ -1323,6 +1323,14 @@ fn handle_server_event_inner(
                     pending.retry_attempts = pending.retry_attempts.saturating_add(1);
                     let is_system = pending.is_system;
                     app.rate_limit_reset = Some(Instant::now() + reset_duration);
+                    if jcode_provider_core::usage_limit_resume::usage_limit_hint_from_text(
+                        &message,
+                        chrono::Utc::now().timestamp(),
+                    )
+                    .is_some()
+                    {
+                        app.watch_usage_limit_recovery();
+                    }
                     if previous_account_limit {
                         app.arm_account_change_resend(Instant::now());
                     } else {
@@ -2654,9 +2662,19 @@ fn handle_server_event_inner(
         }
         event @ ServerEvent::ModelChanged { .. } => model_changed::handle(app, event),
         ServerEvent::AccountUsage {
-            anthropic, openai, ..
+            anthropic,
+            openai,
+            recoveries,
+            ..
         } => {
             crate::usage::set_remote_account_usage(anthropic, openai);
+            for recovery in recoveries {
+                app.resume_after_usage_recovery(
+                    &recovery.provider,
+                    &recovery.account_label,
+                    recovery.checked_at_unix_ms,
+                );
+            }
             crate::tui::ui::prepare::invalidate_header_prep_cache();
             true
         }

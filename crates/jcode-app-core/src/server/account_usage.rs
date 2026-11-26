@@ -59,6 +59,34 @@ pub(super) fn request(id: u64, tx: mpsc::UnboundedSender<ServerEvent>) {
     request_with_refresh(id, tx, false);
 }
 
+/// Provider waits keep polling even when no TUI is attached.
+pub(super) async fn refresh_for_provider_wait() {
+    snapshot_with(STATE.get_or_init(Mutex::default), fetch, false).await;
+}
+
+pub(super) fn request_for_session(
+    id: u64,
+    tx: mpsc::UnboundedSender<ServerEvent>,
+    agent: &std::sync::Arc<Mutex<crate::agent::Agent>>,
+    recovery: bool,
+) {
+    if !recovery {
+        request(id, tx);
+        return;
+    }
+    let instance = agent
+        .try_lock()
+        .ok()
+        .and_then(|agent| super::usage_limit_resume::recovery_account(&agent))
+        .filter(|(provider, _)| provider == "claude-code");
+    tokio::spawn(async move {
+        if let Some((provider, label)) = instance {
+            crate::usage::refresh_usage_limit_recovery(&provider, &label).await;
+        }
+        request(id, tx);
+    });
+}
+
 /// Re-enumerate freshly saved credentials without clearing endpoint caches or
 /// provider Retry-After deadlines. Publish directly so the login's client does
 /// not have to wait for its next periodic usage poll.
@@ -73,6 +101,7 @@ fn request_with_refresh(id: u64, tx: mpsc::UnboundedSender<ServerEvent>, force: 
             id,
             anthropic: snapshot.anthropic,
             openai: snapshot.openai,
+            recoveries: crate::usage::confirmed_available_accounts(),
         });
     });
 }

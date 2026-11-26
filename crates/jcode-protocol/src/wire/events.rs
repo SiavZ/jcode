@@ -2,6 +2,14 @@
 
 use super::*;
 
+/// A live usage probe that confirmed headroom for one account.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountUsageRecovery {
+    pub provider: String,
+    pub account_label: String,
+    pub checked_at_unix_ms: i64,
+}
+
 /// A provider-reported account limit beyond the two legacy quota slots.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccountUsageWindow {
@@ -41,12 +49,26 @@ mod account_usage_tests {
 
     #[test]
     fn account_usage_roundtrips_as_lightweight_control() {
-        let request = Request::AccountUsage { id: 71 };
+        let request = Request::AccountUsage {
+            id: 71,
+            recovery: false,
+        };
         assert!(request.is_lightweight_control_request());
         assert_eq!(request.id(), 71);
         let decoded: Request =
             serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
-        assert!(matches!(decoded, Request::AccountUsage { id: 71 }));
+        assert!(matches!(decoded, Request::AccountUsage { id: 71, .. }));
+        let legacy: Request = serde_json::from_value(serde_json::json!({
+            "type": "account_usage", "id": 71
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            Request::AccountUsage {
+                recovery: false,
+                ..
+            }
+        ));
         let snapshot = AccountUsageSnapshot {
             additional_windows: vec![AccountUsageWindow {
                 label: "Future model / month".into(),
@@ -70,6 +92,11 @@ mod account_usage_tests {
             id: 71,
             anthropic: vec![snapshot.clone()],
             openai: Vec::new(),
+            recoveries: vec![AccountUsageRecovery {
+                provider: "openai".into(),
+                account_label: "remote-account".into(),
+                checked_at_unix_ms: 1234,
+            }],
         };
         let decoded: ServerEvent =
             serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
@@ -77,6 +104,7 @@ mod account_usage_tests {
             id,
             anthropic,
             openai,
+            recoveries,
         } = decoded
         else {
             panic!("wrong response")
@@ -84,6 +112,14 @@ mod account_usage_tests {
         assert_eq!(id, 71);
         assert_eq!(anthropic, vec![snapshot.clone()]);
         assert!(openai.is_empty());
+        assert_eq!(recoveries[0].checked_at_unix_ms, 1234);
+        let legacy: ServerEvent = serde_json::from_value(serde_json::json!({
+            "type": "account_usage", "id": 71, "anthropic": [], "openai": []
+        }))
+        .unwrap();
+        assert!(
+            matches!(legacy, ServerEvent::AccountUsage { recoveries, .. } if recoveries.is_empty())
+        );
         let mut legacy = serde_json::to_value(&snapshot).unwrap();
         legacy.as_object_mut().unwrap().remove("additional_windows");
         let legacy: AccountUsageSnapshot = serde_json::from_value(legacy).unwrap();
@@ -139,6 +175,8 @@ pub enum ServerEvent {
         id: u64,
         anthropic: Vec<AccountUsageSnapshot>,
         openai: Vec<AccountUsageSnapshot>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        recoveries: Vec<AccountUsageRecovery>,
     },
     #[serde(rename = "runtime_command_result")]
     RuntimeCommandResult {
