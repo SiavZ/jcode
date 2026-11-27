@@ -109,6 +109,15 @@ struct Options {
     no_metadata: bool,
     delay_refresh: bool,
     metadata_trailing_slash: bool,
+    /// MCP 2025-03-26 server: no protected-resource metadata, the issuer is
+    /// the origin and only `/.well-known/oauth-authorization-server` exists.
+    legacy: bool,
+    /// Protected-resource metadata names the origin, a parent of `/mcp`.
+    parent_resource: bool,
+    /// No dynamic registration. Clients must bring a configured client ID.
+    no_registration: bool,
+    /// Token endpoint reports Slack's `token_type: "user"`.
+    user_token_type: bool,
 }
 
 #[derive(Default)]
@@ -298,10 +307,16 @@ fn route(
     let path = url.path();
     let resource = if options.metadata_trailing_slash {
         format!("{origin}/mcp/")
+    } else if options.parent_resource {
+        origin.to_string()
     } else {
         format!("{origin}/mcp")
     };
-    let issuer = format!("{origin}/tenant");
+    let issuer = if options.legacy {
+        origin.to_string()
+    } else {
+        format!("{origin}/tenant")
+    };
     if path == "/mcp" && method == "POST" {
         if state.refresh_count > 0
             && headers.contains(&format!("Bearer access-{}", state.refresh_count))
@@ -310,6 +325,9 @@ fn route(
         }
         let challenge = if options.no_challenge {
             String::new()
+        } else if options.legacy {
+            // Atlassian's challenge: Bearer, but no resource_metadata.
+            "WWW-Authenticate: Bearer realm=\"OAuth\", error=\"invalid_token\"\r\n".to_string()
         } else {
             format!(
                 "WWW-Authenticate: Basic realm=\"ignored\"\r\nWWW-Authenticate: Bearer realm=\"a,b\", resource_metadata = \"{origin}/resource\", scope=\"read\"\r\n"
@@ -318,7 +336,7 @@ fn route(
         return response("401 Unauthorized", &challenge, "{}");
     }
     if path == "/resource" || path == "/.well-known/oauth-protected-resource" {
-        if options.no_metadata {
+        if options.no_metadata || options.legacy {
             return response("404 Not Found", "", "{}");
         }
         if options.metadata_redirect {
@@ -337,22 +355,32 @@ fn route(
     if path == "/.well-known/oauth-authorization-server/tenant"
         || path == "/.well-known/openid-configuration/tenant"
         || path == "/tenant/.well-known/openid-configuration"
+        || (options.legacy && path == "/.well-known/oauth-authorization-server")
     {
         if options.oidc_append_only && path != "/tenant/.well-known/openid-configuration" {
             return response("404 Not Found", "", "{}");
         }
-        return json_response(json!({
+        let mut metadata = json!({
             "issuer": if options.wrong_issuer { format!("{origin}/attacker") } else { issuer },
             "authorization_endpoint": format!("{origin}/authorize"),
             "token_endpoint": format!("{origin}/token"),
             "registration_endpoint": format!("{origin}/register"),
             "scopes_supported": ["excessive-global-scope"],
             "code_challenge_methods_supported": [if options.plain_pkce { "plain" } else { "S256" }],
-            "authorization_response_iss_parameter_supported": true,
+            "authorization_response_iss_parameter_supported": !options.legacy,
             "token_endpoint_auth_methods_supported": ["none"],
-        }));
+        });
+        if options.no_registration {
+            metadata["registration_endpoint"] = Value::Null;
+            metadata["token_endpoint_auth_methods_supported"] = json!(["client_secret_post"]);
+        }
+        return json_response(metadata);
     }
     if path == "/register" && method == "POST" {
+        assert!(
+            !options.no_registration,
+            "configured client must not register"
+        );
         let value: Value = serde_json::from_str(body).unwrap();
         assert_eq!(value["token_endpoint_auth_method"], "none");
         assert_eq!(
@@ -372,7 +400,14 @@ fn route(
         assert_eq!(values.get("client_id").unwrap(), "test-public-client");
         assert_eq!(values.get("response_type").unwrap(), "code");
         assert_eq!(values.get("code_challenge_method").unwrap(), "S256");
-        assert_eq!(values.get("resource").unwrap(), &resource);
+        if options.legacy {
+            assert_eq!(values.get("resource"), None);
+        } else {
+            assert_eq!(values.get("resource").unwrap(), &resource);
+        }
+        if options.no_registration {
+            state.registration_redirect = values.get("redirect_uri").cloned();
+        }
         assert_eq!(
             values.get("redirect_uri"),
             state.registration_redirect.as_ref()
@@ -383,8 +418,10 @@ fn route(
         callback
             .query_pairs_mut()
             .append_pair("code", "one-time-auth-code")
-            .append_pair("state", values.get("state").unwrap())
-            .append_pair("iss", &issuer);
+            .append_pair("state", values.get("state").unwrap());
+        if !options.legacy {
+            callback.query_pairs_mut().append_pair("iss", &issuer);
+        }
         return response("303 See Other", &format!("Location: {callback}\r\n"), "{}");
     }
     if path == "/token" && method == "POST" {
@@ -410,7 +447,11 @@ fn route(
         let values: BTreeMap<_, _> = url::form_urlencoded::parse(body.as_bytes())
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
-        assert_eq!(values.get("resource").unwrap(), &resource);
+        if options.legacy {
+            assert_eq!(values.get("resource"), None);
+        } else {
+            assert_eq!(values.get("resource").unwrap(), &resource);
+        }
         assert_eq!(values.get("client_id").unwrap(), "test-public-client");
         if values.get("grant_type").map(String::as_str) == Some("authorization_code") {
             assert_eq!(values.get("code").unwrap(), "one-time-auth-code");
@@ -424,8 +465,18 @@ fn route(
                 state.challenge
             );
             state.code_exchanges += 1;
+            let token_type = if options.user_token_type {
+                "user"
+            } else {
+                "Bearer"
+            };
+            // Later logins (other configured servers) get distinct tokens.
+            let access = match state.code_exchanges {
+                1 => "access-0".to_string(),
+                n => format!("access-0-{n}"),
+            };
             return json_response(
-                json!({"access_token":"access-0", "refresh_token":"refresh-0", "token_type":"Bearer", "expires_in":3600, "scope":"read"}),
+                json!({"access_token":access, "refresh_token":"refresh-0", "token_type":token_type, "expires_in":3600, "scope":"read"}),
             );
         }
         assert_eq!(values.get("grant_type").unwrap(), "refresh_token");
@@ -512,6 +563,280 @@ async fn do_login(fixture: &Fixture, inject_bad_callbacks: bool) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(10), login).await??;
     receiver.await??;
     Ok(())
+}
+
+/// Login for one configured server, returning the authorization URL used.
+async fn do_server_login(
+    fixture: &Fixture,
+    server: &str,
+    options: &LoginOptions,
+) -> Result<url::Url> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let resource = fixture.resource();
+    let login = login_for(
+        Target::server(server, &resource),
+        options,
+        BrowserMode::Print,
+        move |auth_url| {
+            let auth_url = auth_url.to_string();
+            tokio::spawn(async move {
+                let result = browser_login(auth_url.clone(), false).await;
+                let _ = sender.send(result.map(|()| auth_url));
+            });
+        },
+    );
+    tokio::time::timeout(Duration::from_secs(10), login).await??;
+    Ok(url::Url::parse(&receiver.await??)?)
+}
+
+fn query(url: &url::Url, key: &str) -> Option<String> {
+    url.query_pairs()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.into_owned())
+}
+
+#[test]
+fn parent_resource_coverage_is_same_origin_and_segment_bounded() {
+    for (granted, requested) in [
+        ("https://mcp.slack.com", "https://mcp.slack.com/mcp"),
+        ("https://mcp.slack.com/", "https://mcp.slack.com/mcp"),
+        ("https://a.example/v1", "https://a.example/v1/mcp"),
+        ("https://a.example/mcp", "https://a.example/mcp/"),
+    ] {
+        assert!(resource_covers(granted, requested), "{granted} {requested}");
+    }
+    for (granted, requested) in [
+        ("https://a.example/mc", "https://a.example/mcp"),
+        ("https://a.example/mcp", "https://a.example"),
+        ("https://a.example", "https://b.example/mcp"),
+        ("http://a.example", "https://a.example/mcp"),
+        ("https://a.example:8443", "https://a.example/mcp"),
+        ("bad", "https://a.example/mcp"),
+    ] {
+        assert!(
+            !resource_covers(granted, requested),
+            "{granted} {requested}"
+        );
+    }
+}
+
+#[test]
+fn server_targets_use_own_key_then_legacy_url_key() {
+    let url = "https://user:secret@mcp.example/v1/mcp/?token=x";
+    assert_eq!(Target::url(url).keys(), vec!["https://mcp.example/v1/mcp"]);
+    assert_eq!(
+        Target::server("site-a", url).keys(),
+        vec![
+            "https://mcp.example/v1/mcp#server=site-a",
+            "https://mcp.example/v1/mcp",
+        ]
+    );
+}
+
+#[test]
+fn slack_user_token_type_is_accepted_as_bearer() {
+    let mut entry = StoredOAuth::default();
+    let token = serde_json::from_value(json!({"access_token":"xoxp-1", "token_type":"user"}));
+    apply_token(&mut entry, token.unwrap()).unwrap();
+    assert_eq!(entry.access_token.as_deref(), Some("xoxp-1"));
+}
+
+#[test]
+fn login_options_read_claude_code_oauth_config() {
+    let config: crate::mcp::McpServerConfig = serde_json::from_value(json!({
+        "type": "http",
+        "url": "https://mcp.slack.com/mcp",
+        "oauth": {"clientId": " 1601185624273.8899143856786 ", "callbackPort": 3118}
+    }))
+    .unwrap();
+    let options = LoginOptions::from_config(config.oauth.as_ref());
+    assert_eq!(
+        options.client_id.as_deref(),
+        Some("1601185624273.8899143856786")
+    );
+    assert_eq!(options.callback_port, Some(3118));
+    let empty = crate::mcp::McpOAuthConfig {
+        client_id: Some(" ".into()),
+        callback_port: Some(0),
+    };
+    let options = LoginOptions::from_config(Some(&empty));
+    assert!(options.client_id.is_none() && options.callback_port.is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn legacy_server_without_resource_metadata_logs_in_against_origin() {
+    let _sandbox = Sandbox::new();
+    let fixture = Fixture::new(Options {
+        legacy: true,
+        ..Default::default()
+    })
+    .await;
+    let auth_url = do_server_login(&fixture, "site-a", &LoginOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(query(&auth_url, "resource"), None);
+    assert_eq!(query(&auth_url, "scope"), None);
+    let state = fixture.state.lock().unwrap();
+    let paths = state
+        .requests
+        .iter()
+        .map(|(_, target, _)| target.as_str())
+        .collect::<Vec<_>>();
+    let expected = [
+        "/mcp",
+        "/.well-known/oauth-protected-resource/mcp",
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-authorization-server",
+        "/register",
+    ];
+    assert_eq!(&paths[..expected.len()], &expected);
+    drop(state);
+    let resource = fixture.resource();
+    let entry = stored_for(Target::server("site-a", &resource)).unwrap();
+    assert!(entry.legacy_auth);
+    // Refresh also omits `resource`, which the fixture asserts.
+    assert_eq!(
+        token_after_unauthorized_for(Target::server("site-a", &resource), Some("access-0"))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("access-1")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn legacy_fallback_rejects_foreign_issuer_and_advertised_missing_metadata() {
+    let _sandbox = Sandbox::new();
+    let fixture = Fixture::new(Options {
+        legacy: true,
+        wrong_issuer: true,
+        ..Default::default()
+    })
+    .await;
+    assert!(discover(&fixture.resource()).await.is_err());
+    // No metadata of either kind: a clear error, never guessed endpoints.
+    let fixture = Fixture::new(Options {
+        no_challenge: true,
+        no_metadata: true,
+        ..Default::default()
+    })
+    .await;
+    let error = discover(&fixture.resource()).await.err().unwrap();
+    assert!(format!("{error:#}").contains("neither OAuth protected-resource"));
+    assert!(
+        !fixture
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|(_, target, _)| target == "/register")
+    );
+    // A server that advertises resource_metadata must serve it: no fallback.
+    let fixture = Fixture::new(Options {
+        no_metadata: true,
+        ..Default::default()
+    })
+    .await;
+    let error = discover(&fixture.resource()).await.err().unwrap();
+    assert!(format!("{error:#}").contains("protected-resource metadata"));
+    assert!(
+        !fixture
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|(_, target, _)| target == "/.well-known/oauth-authorization-server")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn servers_sharing_a_url_keep_separate_credentials() {
+    let _sandbox = Sandbox::new();
+    let fixture = Fixture::new(Options {
+        legacy: true,
+        ..Default::default()
+    })
+    .await;
+    let resource = fixture.resource();
+    // A credential stored under the bare URL by an older version.
+    seed(&resource, fixture.entry(false));
+    let site_a = Target::server("site-a", &resource);
+    let site_b = Target::server("site-b", &resource);
+    assert_eq!(
+        access_token_for(site_b).await.unwrap().as_deref(),
+        Some("access-0"),
+        "servers fall back to the legacy shared entry"
+    );
+    do_server_login(&fixture, "site-a", &LoginOptions::default())
+        .await
+        .unwrap();
+    do_server_login(&fixture, "site-b", &LoginOptions::default())
+        .await
+        .unwrap();
+    let token_a = access_token_for(site_a).await.unwrap();
+    let token_b = access_token_for(site_b).await.unwrap();
+    assert_eq!(token_a.as_deref(), Some("access-0"));
+    assert_eq!(token_b.as_deref(), Some("access-0-2"));
+    assert!(logout_for(site_a).unwrap());
+    assert_eq!(access_token_for(site_a).await.unwrap(), None);
+    assert!(
+        stored(&resource).is_none(),
+        "server logout clears the shared fallback too"
+    );
+    assert_eq!(
+        access_token_for(site_b).await.unwrap().as_deref(),
+        Some("access-0-2")
+    );
+    assert!(status_for(site_b).unwrap().logged_in);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn configured_client_skips_registration_and_parent_resource_is_accepted() {
+    let _sandbox = Sandbox::new();
+    let fixture = Fixture::new(Options {
+        parent_resource: true,
+        no_registration: true,
+        user_token_type: true,
+        ..Default::default()
+    })
+    .await;
+    // Without a configured client the server cannot be used.
+    let error = login_for(
+        Target::server("slack", &fixture.resource()),
+        &LoginOptions::default(),
+        BrowserMode::Print,
+        |_| panic!("no authorization URL without a client"),
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("oauth.clientId"));
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let options = LoginOptions {
+        client_id: Some("test-public-client".into()),
+        callback_port: Some(port),
+    };
+    let auth_url = do_server_login(&fixture, "slack", &options).await.unwrap();
+    assert_eq!(
+        query(&auth_url, "redirect_uri"),
+        Some(format!("http://localhost:{port}/callback"))
+    );
+    assert_eq!(query(&auth_url, "resource"), Some(fixture.origin.clone()));
+    let resource = fixture.resource();
+    let entry = stored_for(Target::server("slack", &resource)).unwrap();
+    assert_eq!(entry.resource, Some(fixture.origin.clone()));
+    assert!(!entry.legacy_auth);
+    assert_eq!(
+        token_after_unauthorized_for(Target::server("slack", &resource), Some("access-0"))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("access-1")
+    );
 }
 
 #[test]
@@ -678,6 +1003,49 @@ fn pkce_pair_is_random_s256() {
         URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
     );
     assert_ne!(verifier, pkce_pair().0);
+}
+
+#[test]
+fn callback_accepts_issuer_with_trailing_slash() {
+    let meta = metadata();
+    assert_eq!(
+        callback_result(
+            "/callback?code=a&state=state&iss=https%3A%2F%2Fauth.example%2F",
+            "state",
+            &meta,
+        )
+        .unwrap()
+        .as_deref(),
+        Some("a")
+    );
+}
+
+#[test]
+fn callback_accepts_metadata_issuer_with_trailing_slash() {
+    let mut meta = metadata();
+    meta.issuer.push('/');
+    assert_eq!(
+        callback_result(
+            "/callback?code=a&state=state&iss=https%3A%2F%2Fauth.example",
+            "state",
+            &meta,
+        )
+        .unwrap()
+        .as_deref(),
+        Some("a")
+    );
+}
+
+#[test]
+fn callback_rejects_different_issuer_path() {
+    let meta = metadata();
+    let error = callback_result(
+        "/callback?code=a&state=state&iss=https%3A%2F%2Fauth.example%2Ftenant%2F",
+        "state",
+        &meta,
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "OAuth callback issuer mismatch");
 }
 
 #[test]

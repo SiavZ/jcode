@@ -918,6 +918,7 @@ done
             enabled: None,
             disabled: None,
             timeout_secs: None,
+            oauth: None,
         }
     }
 

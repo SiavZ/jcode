@@ -417,6 +417,7 @@ async fn test_list_shows_disabled_configured_server() {
             enabled: Some(false),
             disabled: None,
             timeout_secs: None,
+            oauth: None,
         },
     );
     let manager = Arc::new(RwLock::new(McpManager::with_config(config)));
@@ -445,6 +446,163 @@ async fn test_connect_missing_server() {
     let result = tool.execute(input, ctx).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("server"));
+}
+
+const STATUS_TEST_RESOURCE: &str = "https://example.com/mcp";
+
+fn oauth_status_test_tool(stored_keys: &[&str]) -> McpManagementTool {
+    let servers: serde_json::Map<String, Value> = stored_keys
+        .iter()
+        .map(|key| {
+            (
+                (*key).to_string(),
+                json!({
+                    "client_id": "test",
+                    "token_endpoint": "http://127.0.0.1:1/token",
+                    "access_token": "secret-access",
+                    "refresh_token": "secret-refresh",
+                    "expires_at": 1,
+                    "resource": STATUS_TEST_RESOURCE
+                }),
+            )
+        })
+        .collect();
+    crate::storage::write_json_secret(
+        &crate::storage::jcode_dir().unwrap().join("mcp-oauth.json"),
+        &json!({"version": 1, "servers": servers}),
+    )
+    .unwrap();
+    let config = serde_json::from_value(json!({"servers": {
+        "alpha": {"url": STATUS_TEST_RESOURCE},
+        "beta": {"url": STATUS_TEST_RESOURCE},
+        "static": {
+            "url": STATUS_TEST_RESOURCE,
+            "headers": {"aUtHoRiZaTiOn": "Bearer secret-static"}
+        }
+    }}))
+    .unwrap();
+    McpManagementTool::new(Arc::new(RwLock::new(McpManager::with_config(config))))
+}
+
+#[tokio::test]
+async fn management_status_isolates_same_url_server_oauth_credentials() {
+    let _sandbox = crate::auth::test_sandbox::AuthTestSandbox::new().unwrap();
+    let tool = oauth_status_test_tool(&["https://example.com/mcp#server=alpha"]);
+    let mut statuses = Vec::new();
+
+    for server in ["alpha", "beta"] {
+        let output = tool
+            .execute(
+                json!({"action": "status", "server": server}),
+                create_test_context(),
+            )
+            .await
+            .unwrap();
+        statuses.push(output.output.contains("OAuth credentials stored ("));
+    }
+
+    assert_eq!(statuses, vec![true, false]);
+}
+
+#[tokio::test]
+async fn inspect_isolates_same_url_server_oauth_credentials() {
+    let _sandbox = crate::auth::test_sandbox::AuthTestSandbox::new().unwrap();
+    let tool = oauth_status_test_tool(&["https://example.com/mcp#server=alpha"]);
+
+    let output = tool.inspect_servers().await.unwrap();
+    let servers = output.metadata.unwrap()["servers"].clone();
+    let auth: Vec<_> = servers
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|server| server["name"] != "static")
+        .map(|server| (server["name"].clone(), server["auth"].clone()))
+        .collect();
+
+    assert_eq!(
+        auth,
+        vec![
+            (json!("alpha"), json!("authenticated")),
+            (json!("beta"), json!("not authenticated"))
+        ]
+    );
+}
+
+#[tokio::test]
+async fn management_status_falls_back_to_legacy_url_oauth_credentials() {
+    let _sandbox = crate::auth::test_sandbox::AuthTestSandbox::new().unwrap();
+    let tool = oauth_status_test_tool(&[STATUS_TEST_RESOURCE]);
+    let mut statuses = Vec::new();
+
+    for server in ["alpha", "beta"] {
+        let output = tool
+            .execute(
+                json!({"action": "status", "server": server}),
+                create_test_context(),
+            )
+            .await
+            .unwrap();
+        statuses.push(output.output.contains("OAuth credentials stored ("));
+    }
+
+    assert_eq!(statuses, vec![true, true]);
+}
+
+#[tokio::test]
+async fn inspect_falls_back_to_legacy_url_oauth_credentials() {
+    let _sandbox = crate::auth::test_sandbox::AuthTestSandbox::new().unwrap();
+    let tool = oauth_status_test_tool(&[STATUS_TEST_RESOURCE]);
+
+    let output = tool.inspect_servers().await.unwrap();
+    let servers = output.metadata.unwrap()["servers"].clone();
+    let auth: Vec<_> = servers
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|server| server["name"] != "static")
+        .map(|server| server["auth"].clone())
+        .collect();
+
+    assert_eq!(auth, vec![json!("authenticated"), json!("authenticated")]);
+}
+
+#[tokio::test]
+async fn management_status_static_header_takes_precedence_over_server_oauth() {
+    let _sandbox = crate::auth::test_sandbox::AuthTestSandbox::new().unwrap();
+    let tool = oauth_status_test_tool(&["https://example.com/mcp#server=static"]);
+
+    let output = tool
+        .execute(
+            json!({"action": "status", "server": "static"}),
+            create_test_context(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        output
+            .output
+            .contains("Static Authorization header configured (takes precedence over OAuth)"),
+        "{}",
+        output.output
+    );
+}
+
+#[tokio::test]
+async fn inspect_static_header_authenticates_without_server_oauth() {
+    let _sandbox = crate::auth::test_sandbox::AuthTestSandbox::new().unwrap();
+    let tool = oauth_status_test_tool(&["https://example.com/mcp#server=alpha"]);
+
+    let output = tool.inspect_servers().await.unwrap();
+    let servers = output.metadata.unwrap()["servers"].clone();
+    let static_server = servers
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|server| server["name"] == "static")
+        .unwrap();
+
+    assert_eq!(static_server["auth"], "authenticated");
 }
 
 #[tokio::test]

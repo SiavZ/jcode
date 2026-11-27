@@ -265,6 +265,26 @@ pub struct McpServerConfig {
     /// extraction) can raise it here (issues #802, #1174).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    /// OAuth client settings for remote servers, Claude Code compatible:
+    /// `"oauth": {"clientId": "...", "callbackPort": 3118}`. Needed for
+    /// servers without dynamic client registration, such as Slack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<McpOAuthConfig>,
+}
+
+/// Pre-registered OAuth client for a remote MCP server. Only public (PKCE)
+/// clients are supported, so there is deliberately no client secret field.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpOAuthConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "client_id")]
+    pub client_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "callback_port"
+    )]
+    pub callback_port: Option<u16>,
 }
 
 impl McpServerConfig {
@@ -746,6 +766,7 @@ impl McpConfig {
                             enabled,
                             disabled: None,
                             timeout_secs: None,
+                            oauth: None,
                         },
                     );
                 }

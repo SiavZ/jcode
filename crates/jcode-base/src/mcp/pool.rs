@@ -738,6 +738,7 @@ mod tests {
                 enabled: None,
                 disabled: None,
                 timeout_secs: None,
+                oauth: None,
             },
         );
         let pool = SharedMcpPool::new(config);

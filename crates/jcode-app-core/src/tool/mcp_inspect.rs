@@ -74,7 +74,7 @@ impl McpManagementTool {
                     "source": source,
                     "scope": scope_of(source),
                     "config_location": config_location(source, project),
-                    "auth": cfg.and_then(auth_state),
+                    "auth": cfg.and_then(|cfg| auth_state(name, cfg)),
                     "tools": tools,
                 })
             })
@@ -127,13 +127,14 @@ fn config_location(source: &str, project: Option<&std::path::Path>) -> String {
 
 /// Remote servers: `authenticated` with stored OAuth tokens or a static
 /// Authorization header, else `not authenticated`. None for stdio.
-fn auth_state(cfg: &McpServerConfig) -> Option<&'static str> {
+fn auth_state(name: &str, cfg: &McpServerConfig) -> Option<&'static str> {
     let url = cfg.url.as_deref().filter(|_| cfg.is_remote())?;
     let static_header = cfg
         .headers
         .keys()
         .any(|key| key.eq_ignore_ascii_case("authorization"));
-    let logged_in = crate::mcp::oauth::stored(url).is_some();
+    let logged_in =
+        crate::mcp::oauth::stored_for(crate::mcp::oauth::Target::server(name, url)).is_some();
     Some(if static_header || logged_in {
         "authenticated"
     } else {

@@ -565,6 +565,7 @@ fn connection_config(
         enabled: None,
         disabled: None,
         timeout_secs: None,
+        oauth: None,
     })
 }
 
@@ -791,8 +792,14 @@ impl McpManagementTool {
                 )
             })?;
         validate_remote_url(url)?;
+        // A configured server name selects that server's own credentials. A raw
+        // URL addresses the shared entry older versions stored under it.
+        let target = match params.server.as_deref().filter(|_| configured.is_some()) {
+            Some(name) => crate::mcp::oauth::Target::server(name, url),
+            None => crate::mcp::oauth::Target::url(url),
+        };
         if params.action == "logout" {
-            let removed = crate::mcp::oauth::logout(url)?;
+            let removed = crate::mcp::oauth::logout_for(target)?;
             return Ok(ToolOutput::new(format!("{}. Static headers and existing connections are unchanged. This only forgets local OAuth credentials, not server-side authorization. Disconnect/reconnect active servers to stop using the old token.",
                 if removed { "Removed local OAuth credentials" } else { "No local OAuth credentials stored" }))
                 .with_title("MCP: OAuth logout"));
@@ -808,7 +815,7 @@ impl McpManagementTool {
             });
         let status = if static_auth {
             "Static Authorization header configured (takes precedence over OAuth)"
-        } else if crate::mcp::oauth::status(url)?.logged_in {
+        } else if crate::mcp::oauth::status_for(target)?.logged_in {
             "OAuth credentials stored (not a connection or token-validity check)"
         } else {
             "No OAuth credentials stored. To sign in, run `jcode mcp login <configured-server>` in a terminal."

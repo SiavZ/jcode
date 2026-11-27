@@ -740,16 +740,19 @@ where
     StatusOf: Fn(&Value, &str) -> Option<(String, Option<String>)>,
 {
     let config = crate::mcp::McpConfig::load_for_dir(working_dir);
-    let url = config
+    let remote = config
         .servers
         .get(server)
         .filter(|cfg| cfg.is_remote())
-        .and_then(|cfg| cfg.url.clone())
         .ok_or_else(|| {
             anyhow::anyhow!("MCP server \"{server}\" uses stdio; only HTTP/SSE servers sign in")
         })?;
+    let url = remote.url.clone().ok_or_else(|| {
+        anyhow::anyhow!("MCP server \"{server}\" uses stdio; only HTTP/SSE servers sign in")
+    })?;
+    let target = crate::mcp::oauth::Target::server(server, &url);
     if action == "clear-auth" {
-        crate::mcp::oauth::logout(&url)?;
+        crate::mcp::oauth::logout_for(target)?;
         run("disconnect", Some(server)).await.ok();
         return Ok((
             inspect().await?,
@@ -757,9 +760,15 @@ where
         ));
     }
     let was_connected = status_of(&inspect().await?, server).is_some_and(|(s, _)| s == "connected");
-    crate::mcp::oauth::login(&url, crate::mcp::oauth::BrowserMode::Open, |_| {})
-        .await
-        .map_err(|error| anyhow::anyhow!("Failed to authenticate {server}: {error:#}"))?;
+    let options = crate::mcp::oauth::LoginOptions::from_config(remote.oauth.as_ref());
+    crate::mcp::oauth::login_for(
+        target,
+        &options,
+        crate::mcp::oauth::BrowserMode::Open,
+        |_| {},
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("Failed to authenticate {server}: {error:#}"))?;
     run("disconnect", Some(server)).await.ok();
     run("connect", Some(server)).await.ok();
     let data = inspect().await?;

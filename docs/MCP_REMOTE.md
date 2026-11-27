@@ -63,11 +63,39 @@ fails. It does not invoke an LLM or run the server's tools.
 public client when supported, and completes an authorization-code flow with
 PKCE and a loopback callback. `--no-browser` prints the authorization URL rather
 than opening the system browser; the browser still needs access to the machine's
-loopback callback. If the authorization server does not support dynamic client
-registration, configure an Authorization header instead.
+loopback callback.
+
+Discovery prefers protected-resource metadata (MCP 2025-06-18). Servers built
+for MCP 2025-03-26, such as Atlassian's `https://mcp.atlassian.com/v1/mcp`,
+publish none. When the 401 challenge does not advertise any, `login` falls back
+to `/.well-known/oauth-authorization-server` at the MCP origin, requires that
+origin as the issuer, and omits the RFC 8707 `resource` parameter as that
+revision's clients do. Protected-resource metadata may also name a parent of
+the endpoint on the same origin, as Slack's does.
+
+If the authorization server does not support dynamic client registration,
+configure a pre-registered public client with Claude Code's `oauth` block, or an
+Authorization header. The callback port must match the client's registered
+redirect URI, `http://localhost:<port>/callback`:
+
+```json
+{
+  "mcpServers": {
+    "slack": {
+      "type": "http",
+      "url": "https://mcp.slack.com/mcp",
+      "oauth": { "clientId": "<client id>", "callbackPort": 3118 }
+    }
+  }
+}
+```
 
 Tokens are stored in the Jcode home directory's `mcp-oauth.json` with restrictive
-permissions. They are scoped to the remote resource and refreshed without
+permissions. Each configured server keeps its own credentials, so several
+entries with the same URL (one per Atlassian site or Slack workspace) can sign
+in to different accounts. Credentials saved under the bare URL by older versions
+remain a fallback until that server signs in again or logs out. Logging out a
+server also forgets that shared fallback. Tokens are refreshed without
 opening a browser. Background startup and ordinary connection attempts never
 start an interactive login. A rejected or missing credential reports the
 appropriate explicit login command rather than waiting for human interaction.

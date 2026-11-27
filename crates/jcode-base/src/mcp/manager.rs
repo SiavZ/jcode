@@ -948,7 +948,8 @@ mod tests {
         let calls = temp.path().join("calls");
         std::fs::write(
             &script,
-            r##"while IFS= read -r line; do
+            r##"#!/bin/sh
+while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
   case "$line" in
     *'"initialize"'*)
@@ -985,6 +986,7 @@ done
                 enabled: None,
                 disabled: None,
                 timeout_secs: Some(5),
+                oauth: None,
             },
         );
         let manager = McpManager::with_config(config);
@@ -1035,6 +1037,7 @@ done
                 enabled: Some(false),
                 disabled: None,
                 timeout_secs: None,
+                oauth: None,
             },
         );
         let manager = McpManager::with_config(config);
@@ -1070,6 +1073,7 @@ done
                 enabled: None,
                 disabled: None,
                 timeout_secs: None,
+                oauth: None,
             },
         );
         let manager = McpManager::with_config(config);
@@ -1182,6 +1186,7 @@ done
                 enabled: None,
                 disabled: None,
                 timeout_secs: Some(10),
+                oauth: None,
             },
         );
         let config = config
@@ -1304,6 +1309,7 @@ done
                 enabled: None,
                 disabled: None,
                 timeout_secs: None,
+                oauth: None,
             },
         );
         let manager = McpManager::with_config(config.clone());
@@ -1386,6 +1392,7 @@ done
                 enabled: None,
                 disabled: None,
                 timeout_secs: Some(10),
+                oauth: None,
             },
         );
         let pool = Arc::new(SharedMcpPool::new(config.clone()));
