@@ -44,6 +44,11 @@ pub fn model_route_reasoning_efforts(
             levels.clear();
         }
         levels
+    } else if matches!(
+        crate::provider::ModelRouteApiMethod::parse(api_method),
+        crate::provider::ModelRouteApiMethod::ClaudeCode { .. }
+    ) {
+        claude_code_reasoning_efforts(model)
     } else if route_supports_reasoning_effort(api_method) {
         jcode_provider_core::inferred_reasoning_efforts(Some(api_method), Some(model))
     } else {
@@ -53,6 +58,23 @@ pub fn model_route_reasoning_efforts(
         .into_iter()
         .filter(|level| !crate::prompt::is_swarm_mode_effort(level))
         .collect()
+}
+
+/// The `claude --effort` levels this model accepts. The CLI has no "none"
+/// level, so the native Anthropic ladder cannot be reused as is.
+fn claude_code_reasoning_efforts(model: &str) -> Vec<&'static str> {
+    let caps = jcode_provider_core::anthropic_reasoning_caps(model);
+    if !caps.output_effort {
+        return Vec::new();
+    }
+    let mut levels = vec!["low", "medium", "high"];
+    if caps.xhigh_effort {
+        levels.push("xhigh");
+    }
+    if caps.max_effort {
+        levels.push("max");
+    }
+    levels
 }
 
 /// Return the named OpenAI-compatible profile's actual effort ladder, or None
@@ -149,13 +171,14 @@ pub fn route_supports_reasoning_effort(api_method: &str) -> bool {
         | Method::AnthropicApiKey
         | Method::OpenAIOAuth
         | Method::OpenAIApiKey
-        | Method::OpenRouter => true,
+        | Method::OpenRouter
+        // Applied by respawning the CLI with `--effort`; see claude_code_reasoning_efforts.
+        | Method::ClaudeCode { .. } => true,
         // Named profiles are checked against their configured capabilities in
         // model_route_effort_levels, which opens a second-step level picker.
         Method::OpenAiCompatible { .. } => false,
         Method::JcodeSubscription
         | Method::GrokBuild
-        | Method::ClaudeCode { .. }
         | Method::Copilot
         | Method::Cursor
         | Method::Bedrock
@@ -164,5 +187,24 @@ pub fn route_supports_reasoning_effort(api_method: &str) -> bool {
         | Method::RemoteCatalog
         | Method::Current
         | Method::Other(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn claude_code_routes_offer_the_cli_effort_levels_each_model_accepts() {
+        let config = crate::config::Config::default();
+        let levels =
+            |model, method| super::model_route_reasoning_efforts(model, method, None, &config);
+        assert_eq!(
+            levels("claude-opus-4-7", "claude-code:claude-fox"),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            levels("claude-opus-4-6", "claude-code"),
+            ["low", "medium", "high", "max"]
+        );
+        assert!(levels("claude-sonnet-4-5-20250929", "claude-code").is_empty());
     }
 }
